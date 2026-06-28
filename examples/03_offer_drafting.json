@@ -1,0 +1,15 @@
+{
+  "_entry_point": "direct_call_correspondence_drafter",
+  "_description": "Candidate cleared all loops \u2014 correspondence_drafter (offer mode, inferred from the offer terms) produces the offer letter, within_band check confirms compensation policy.",
+  "payload": {
+    "req_id": "REQ-2026-0099",
+    "candidate_id": "cand-tw-2026-1503",
+    "candidate_name": "Talia Wong",
+    "stage_reached": "offer",
+    "proposed_base_cents": 22000000,
+    "proposed_equity_units": 3500,
+    "proposed_signing_bonus_cents": 1500000,
+    "start_date": "2026-07-21",
+    "level": "senior"
+  }
+}

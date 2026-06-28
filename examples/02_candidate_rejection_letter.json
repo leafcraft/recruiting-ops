@@ -1,0 +1,14 @@
+{
+  "_entry_point": "candidate_rejection",
+  "_description": "Phone-screen reject \u2014 correspondence_drafter (rejection mode) generates a personalised note with one specific feedback point.",
+  "payload": {
+    "correspondence_type": "rejection",
+    "candidate_id": "cand-jp-2026-1421",
+    "candidate_name": "Jordan Park",
+    "req_id": "REQ-2026-0099",
+    "stage_reached": "phone_screen",
+    "interviewer_notes": "Strong Python fundamentals but limited production-payments exposure (only side projects). Communicated well; recommended encouraging future application after PSP exposure.",
+    "tone_preference": "warm",
+    "anonymise_panel": true
+  }
+}

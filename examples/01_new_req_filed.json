@@ -1,0 +1,23 @@
+{
+  "_entry_point": "req_filed",
+  "_description": "Hiring manager files a senior engineer req. req_intake normalises; sourcing_agent then pulls the candidate pipeline from your ATS connector; screener filters.",
+  "payload": {
+    "req_id": "REQ-2026-0099",
+    "title": "Senior Backend Engineer \u2014 Payments",
+    "level": "senior",
+    "location": "remote_us",
+    "hiring_manager": "eng.manager@example",
+    "team": "Payments Platform",
+    "salary_band_low_cents": 18000000,
+    "salary_band_high_cents": 24000000,
+    "must_haves": [
+      "7+ years Python",
+      "Production payments experience",
+      "Distributed systems"
+    ],
+    "nice_to_haves": [
+      "FinTech background",
+      "Open-source contributions"
+    ]
+  }
+}
