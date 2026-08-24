@@ -120,6 +120,17 @@ async def enforce_correspondence_floors(result: dict[str, Any],
             logger.info(
                 f"[corr] OFFER band gate → HRBP "
                 f"(amount={amount} band={low}-{high} confirmed={band_confirmed})")
+        # Persist the offer so the finisher (Ora) can recover it AFTER the
+        # hiring-manager approval gate drops the upstream payload. PROD: HRIS.
+        rid = str(result.get("req_id") or c.get("req_id") or "")
+        if rid:
+            store.put_offer(rid, {
+                "req_id": rid,
+                "candidate_id": str(c.get("candidate_id") or ""),
+                "offer_amount_cents": amount,
+                "offer_body": str(result.get("offer_body") or ""),
+                "within_band": result["within_band"],
+            })
 
     elif ctype == "rejection":
         msg = str(result.get("candidate_facing_message", ""))

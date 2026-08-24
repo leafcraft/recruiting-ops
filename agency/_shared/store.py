@@ -237,3 +237,108 @@ def set_stage(candidate_id: str, stage: str) -> None:
             c["stage"] = stage
             c["stage_updated_at"] = _now()
             _save("candidates", s)
+
+
+# ── Atomic claim queue — backlog fan-out for Sena's parallel `instances`.
+# Each copy calls claim_candidate_batch(req_id, count); the LPOP-style atomic
+# pop under a lock guarantees copies pull DISJOINT candidates (no duplicate
+# work). PROD: `UPDATE ... SKIP LOCKED RETURNING` on the ATS candidate table,
+# or Redis LPOP. The in-memory queue below is the dev stand-in.
+# ─────────────────────────────────────────────────────────────────────────
+_CLAIM_QUEUES: dict[str, list[str]] = {}
+
+
+def _ensure_queue(req_id: str) -> list[str]:
+    """Lazily seed the claim queue for a req from its screen-stage pipeline."""
+    if req_id not in _CLAIM_QUEUES:
+        _CLAIM_QUEUES[req_id] = [c["candidate_id"]
+                                 for c in pipeline(req_id, stage="screen")]
+    return _CLAIM_QUEUES[req_id]
+
+
+def claim_candidate_batch(req_id: str, count: int = 4) -> dict[str, Any]:
+    """Atomically claim up to `count` unscreened candidates for a req.
+
+    Returns {available: bool, req_id, candidates: [...], remaining: int}. When
+    the queue is drained it announces available:false — never a synthetic empty
+    success. PROD: atomic pop from the ATS / Redis backlog.
+    """
+    req_id = str(req_id or "").strip()
+    if not req_id:
+        return {"available": False, "reason": "no req_id to claim against"}
+    try:
+        n = max(1, int(count))
+    except (TypeError, ValueError):
+        n = 4
+    with _LOCK:
+        q = _ensure_queue(req_id)
+        if not q:
+            return {"available": False, "req_id": req_id, "candidates": [],
+                    "remaining": 0,
+                    "reason": f"no unclaimed candidates for req {req_id!r}; "
+                              f"wire ${{N8N_SOURCING_WEBHOOK_URL}}"}
+        claimed_ids = [q.pop(0) for _ in range(min(n, len(q)))]
+        cands = _candidates()
+        return {"available": True, "req_id": req_id,
+                "candidates": [cands.get(cid, {"candidate_id": cid})
+                               for cid in claimed_ids],
+                "remaining": len(q)}
+
+
+# ── Offers (dev mirror of the HRIS offer record) + append-only ledger +
+#    outbox — the finisher (Ora) writes here day-0 with no connector wired. ──
+def put_offer(req_id: str, offer: dict[str, Any]) -> None:
+    """Persist a drafted offer so the finisher can recover it across the HITL
+    approval gate (the upstream payload is dropped after the human gate).
+    PROD: the HRIS / ATS offer record."""
+    key = str(req_id or "").strip()
+    if not key:
+        return
+    with _LOCK:
+        offers = _load("offers")
+        offers[key] = {"stored_at": _now(), **offer}
+        _save("offers", offers)
+
+
+def get_offer(req_id: str) -> dict[str, Any]:
+    """Recover a drafted offer by req_id. PROD: HRIS / ATS offer record."""
+    return _load("offers").get(str(req_id or "").strip(), {})
+
+
+def record_outbox(entry: dict[str, Any]) -> dict[str, Any]:
+    """The finisher's send record (dev stand-in for the real delivery). This is
+    a DEV record, not a real ack — the finisher marks delivery accordingly."""
+    with _LOCK:
+        outbox = _load_list("outbox")
+        rec = {"recorded_at": _now(), **entry}
+        outbox.append(rec)
+        _save_list("outbox", outbox)
+    return rec
+
+
+def append_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only offer ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        ledger = _load_list("offer_ledger")
+        rec = {"recorded_at": _now(), **entry}
+        ledger.append(rec)
+        _save_list("offer_ledger", ledger)
+    return rec
+
+
+def _load_list(k: str) -> list[dict[str, Any]]:
+    p = _path(k)
+    if not p.exists():
+        return []
+    try:
+        data = json.loads(p.read_text())
+        return data if isinstance(data, list) else []
+    except (ValueError, OSError):
+        return []
+
+
+def _save_list(k: str, d: list[dict[str, Any]]) -> None:
+    p = _path(k)
+    t = p.with_suffix(".json.tmp")
+    t.write_text(json.dumps(d, indent=2, default=str))
+    t.replace(p)

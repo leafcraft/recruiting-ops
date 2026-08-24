@@ -1,23 +1,23 @@
-"""resume_screener_agent — scores the pipeline against the req, with the
-bias signal and score floor enforced as deterministic floors.
+"""resume_screener_agent — Sena, the Screening Analyst.
 
-@pre_compose  load_pipeline — pull the req spec + the actual candidate
-              pipeline (resume data + any prior screens) from the ATS
-              (dev: store) so the LLM scores REAL candidates, not a blank.
-@chain        enforce_screen_floors — floors the LLM can't waive:
-              (a) BIAS: if the model's own reasoning leaned on a
-                  bias-prone signal (name / school prestige / photo /
-                  address), force bias_signal=true → routes to HRBP. The
-                  prompt asks for this; the floor GUARANTEES it.
-              (b) SCORE FLOOR: a thin shortlist (< MIN_SHORTLIST) or an
-                  avg fit below MIN_AVG_FIT can never be waved through to
-                  outreach — set re_source_required and bound the
-                  re-source loop (Rule 3) so a thin pipeline escalates
-                  to the recruiter instead of looping.
+auto_discover matches `resume_screener_agent`. Sena is an llm + super_agent that
+CLAIMS and READS the candidate pipeline through her tools (claim_candidate_batch
+-> get_req_spec -> get_candidate) and produces a skills-and-experience shortlist.
+The MODEL decides and pulls; this CODE fails closed.
 
-WHY PYTHON: the screen is the first compliance-critical gate — a biased
-shortlist or a quietly-lowered fit bar is exactly what a prompt cannot be
-trusted to hold under pressure. The floor is deterministic code.
+She runs as `instances: 3` (config): three parallel copies each claim a DISJOINT
+batch via the atomic claim tool, so the backlog is split, not duplicated. With
+`instances_handoff: last` the copies' shortlists CONCATENATE into one — and this
+is exactly why the number-sum merge footgun (nuances #Parallel instances) never
+bites here: enforce_screen_floors RECOMPUTES avg_fit_score from the combined
+shortlist rather than trusting a summed self-report.
+
+@chain enforce_screen_floors — the deterministic floors a prompt can't waive:
+  (a) BIAS: if any top_reason / briefing leans on a bias-prone signal (name /
+      school prestige / photo / address), force bias_signal=true -> HRBP.
+  (b) SCORE: recompute avg fit from the shortlist; a thin shortlist
+      (< MIN_SHORTLIST) or a weak avg (< MIN_AVG_FIT) forces re_source_required,
+      and the re-source loop is bounded (Rule 3) so it escalates, never spins.
 """
 from __future__ import annotations
 
@@ -25,19 +25,19 @@ import json
 import re
 from typing import Any
 
-from leafmesh import LeafMeshLogger, pre_compose, chain
-from agency._shared import store, session_stash
+from leafmesh import LeafMeshLogger, chain
+from agency._shared import session_stash
 
 logger = LeafMeshLogger(__name__)
 
 # Deterministic screen floors — compliance-critical, not waivable.
-MIN_SHORTLIST = 3          # fewer than this → re-source, not outreach
-MIN_AVG_FIT = 0.55         # avg fit below this → pipeline too weak to advance
+MIN_SHORTLIST = 3          # fewer than this -> re-source, not outreach
+MIN_AVG_FIT = 0.55         # avg fit below this -> pipeline too weak to advance
 MAX_RESOURCE_ROUNDS = 2    # bound the thin-pipeline re-source loop (Rule 3)
 
-# Bias-prone signal terms. If the model's own reasoning / top_reason text
-# leans on any of these (rather than skills + experience), it is a bias
-# signal regardless of what the model self-reported.
+# Bias-prone signal terms. If the model's own reasoning / top_reason text leans
+# on any of these (rather than skills + experience), it is a bias signal
+# regardless of what the model self-reported.
 _BIAS_TERMS = (
     "name", "sounds", "ethnic", "gender", "photo", "headshot", "age",
     "ivy", "prestige", "prestigious", "alma mater", "pedigree",
@@ -50,40 +50,11 @@ _DEFAULTS: dict[str, Any] = {
 }
 
 
-def _req_id(data: Any) -> str:
-    if not isinstance(data, dict):
-        return ""
-    rid = data.get("req_id")
-    if not rid:
-        uy = data.get("upstream_yields")
-        if isinstance(uy, dict):
-            rid = uy.get("req_id")
-            if not rid:
-                for v in uy.values():
-                    if isinstance(v, dict) and v.get("req_id"):
-                        rid = v["req_id"]
-                        break
-    return str(rid or "")
-
-
 def _sid(input_data: Any, context: Any) -> str:
     for s in (context, input_data):
         if isinstance(s, dict) and s.get("session_id"):
             return str(s["session_id"])
     return ""
-
-
-def load_pipeline(data: Any, ctx: Any) -> dict[str, Any]:
-    """Pull the req spec + the candidate pipeline the LLM will score."""
-    rid = _req_id(data)
-    req = store.get_req(rid) if rid else {}
-    cands = store.pipeline(rid, stage="screen") if rid else []
-    return {"context": {
-        "req_id": rid,
-        "req": req,
-        "candidates": cands,
-        "candidate_count": len(cands),
-    }}
 
 
 def _parse(resp: Any) -> dict[str, Any]:
@@ -108,7 +79,9 @@ def _bias_in_text(blob: str) -> bool:
 
 
 async def enforce_screen_floors(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    result = result if isinstance(result, dict) else {}
     shortlist = result.get("shortlist") or []
+
     # (a) BIAS FLOOR — the model's reasoning text betrays bias-prone leaning.
     reasons = " ".join(
         str((s or {}).get("top_reason", "")) for s in shortlist if isinstance(s, dict)
@@ -116,8 +89,8 @@ async def enforce_screen_floors(result: dict[str, Any], ctx: Any) -> dict[str, A
     if _bias_in_text(reasons) or _bias_in_text(str(result.get("recruiter_briefing", ""))):
         result["bias_signal"] = True   # force — overrides the model's self-report
 
-    # (b) SCORE FLOOR — recompute avg fit from the shortlist (don't trust
-    #     the model's self-reported average), then hold the line.
+    # (b) SCORE FLOOR — RECOMPUTE avg fit from the (possibly instance-combined)
+    #     shortlist; never trust a summed / self-reported average.
     fits = [float((s or {}).get("fit_score", 0) or 0)
             for s in shortlist if isinstance(s, dict)]
     avg = round(sum(fits) / len(fits), 3) if fits else 0.0
@@ -135,10 +108,11 @@ async def enforce_screen_floors(result: dict[str, Any], ctx: Any) -> dict[str, A
     return result
 
 
-@pre_compose(context_processor=load_pipeline)
 @chain(enforce_screen_floors)
 async def resume_screener_agent(llm_response: Any, input_data: Any,
                                 context: Any) -> dict[str, Any]:
+    """Return the model's skills-and-experience shortlist; the floor re-checks
+    it (bias + score). The model pulls the pipeline via its claim/read tools."""
     llm = _parse(llm_response)
     out = {**_DEFAULTS}
     out["shortlist"] = list(llm.get("shortlist") or [])

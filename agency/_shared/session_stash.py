@@ -42,3 +42,19 @@ def peek(session_id: str, key: str, default: int = 0) -> int:
     sid = session_id or "_nosession"
     with _LOCK:
         return int(_STASH.get(sid, {}).get(key, default))
+
+
+def resolve_session_id(input_data: Any, context: Any) -> str:
+    """Best-effort session id, tolerating the several shapes the SDK delivers
+    it in — used by the finisher to recover the offer across the HITL gate."""
+    for src in (input_data, context):
+        if not isinstance(src, dict):
+            continue
+        for key in ("session_id", "sessionId"):
+            sid = src.get(key)
+            if sid:
+                return str(sid)
+        owd = src.get("original_webhook_data")
+        if isinstance(owd, dict) and owd.get("session_id"):
+            return str(owd["session_id"])
+    return ""

@@ -1,15 +1,18 @@
-# recruiting-ops — Recruiting Operations
+# recruiting-ops — Recruiting-Operations Pod
 #
-# recruit × services. source → screen → outreach → schedule → offer.
-# Sourcer / recruiter / hiring-manager / HRBP HITL chain.
+# A pod of digital employees + human roles that runs a hire end to end:
+# requisition -> source -> screen (confidence + bias floor) -> async screen ->
+# correspondence (outreach / offer / rejection) -> interview loop -> panel
+# booking -> offer approval -> OFFER ISSUED (finisher) -> live funnel status.
 #
-# YAML-FIRST: this file IS the department. Candidates live in YOUR
-# ATS (Greenhouse / Lever / Ashby), interviews in YOUR calendar —
-# the sourcing, funnel-ledger and panel-booking agents are pure
-# connector config pointing at those systems. The only Python left
-# is the EEOC 4/5ths-rule math in agency/bias_audit_agent.py
-# (compliance math stays deterministic code) and the shared WORM
-# audit sink.
+# The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
+# is a finished contract; every human gate default-denies on silence; the
+# finisher (Ora) produces the real offer artifact and fails closed; the WORM
+# sink is the terminus. Systems (the ATS — Greenhouse / Lever / Ashby, the
+# calendar, LinkedIn Recruiter) are TOOLS inside agents, never members.
+#
+# Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
+# Field reference:  .claude/skills/leafmesh/agent-config-fields.md
 
 name: "recruiting-ops"
 version: "1.0.0"
@@ -18,89 +21,59 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-redis:
-  host: "${REDIS_HOST:localhost}"
-  port: ${REDIS_PORT:6379}
-  db: 0
-  password: "${REDIS_PASSWORD:}"
-  auto_storage: true
-  decode_responses: true
-  default_ttl: 86400
-  session_ttl: 2592000
+persistence:
+  backend: redis
+  redis:
+    host: "${REDIS_HOST:localhost}"
+    port: ${REDIS_PORT:6379}
+    db: 0
+    password: "${REDIS_PASSWORD:}"
+    auto_storage: true
+    decode_responses: true
+    default_ttl: 86400
+    session_ttl: 2592000
 
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
+# The Manager is the SUPERVISOR — it watches every hand-off and escalates
+# stalls / contract violations / repeated errors to the HRBP (the accountable
+# owner). It is not a router in the middle of the team.
 manager:
-  enabled: true
   model: "gpt-4o-mini"
   domain: "generic"
-  can_intervene: true
   prompt: |
-    Recruiting ops mesh. Successful turn:
-      - req_intake_agent normalises the requisition
-      - sourcing_agent pulls candidates from the customer's ATS /
-        LinkedIn Recruiter via its connector
-      - resume_screener filters against the spec
-      - correspondence_drafter writes ALL candidate correspondence —
-        outreach messages, offer letters (always reviewed) and
-        rejection letters — inferring the mode from its input
-      - interview_coordinator_agent designs the interview loop;
-        clean loops route to panel_booker_agent which books the
-        panel into the customer's calendar / ATS scheduling; flagged
-        loops go to the recruiter first
-      - recruiting_ops_agent reads the funnel / stage ledger from
-        the customer's ATS and escalates thin funnels
-      - HR + hiring manager + recruiter HITL chain
-
-    Escalate when:
-      - bias signal detected in screening
-      - candidate pipeline thin (top-of-funnel below SLA)
-      - offer outside salary band
-
+    This mesh runs recruiting operations end to end. A successful hire flows
+    requisition -> Cass opens the case -> intake normalises it -> sourcing pulls
+    a pipeline -> Sena screens it (confidence + bias floor) -> correspondence
+    (outreach / offer / rejection) -> interview loop -> panel booking -> the
+    hiring manager approves the offer -> Ora ISSUES it -> live funnel status.
+    Escalate to the HRBP when: a screen raises a bias signal, an offer is outside
+    the salary band, a pipeline stays thin past its re-source bound, an approval
+    round times out, or any agent hands off a malformed artifact. Silence never
+    advances a candidate.
   routing:
-    mode: "learning"
-    memory_size: 200
-    confidence_threshold: 0.7
-    fallback: "all"
-    decay_days: 30
-
-  knowledge:
-    serviceName: "mongo_main"
-    enabled: true
-    groupName: "recruiting_runbook"
-
+    mode: "static"
   escalation:
     targets:
       - type: "human_agent"
         agent: "hrbp_human"
-      - type: "webhook"
-        url: "${PAGER_WEBHOOK:https://events.pagerduty.com/v2/enqueue}"
-        method: "POST"
-        headers:
-          Content-Type: "application/json"
-        payload_template:
-          incident_id: "{{req_id}}"
-          severity: "{{severity}}"
-          message: "{{message}}"
-          session_id: "{{session_id}}"
-      - type: "channel"
-        provider: "slack"
-        channel_id: "${SLACK_RECRUITING_CHANNEL:}"
-        message_template: "[recruiting] {{message}} — req {{req_id}}"
     auto_escalate:
-      max_retries: 2
-      max_errors_per_session: 3
+      max_retries: 3
+      max_errors_per_session: 5
       timeout_threshold: 2
 
-  health_check_interval: 60
-  agent_timeout_threshold: 300
-  chain_completion_timeout: 600
-
 mesh:
-  call_timeout: 120
+  call_timeout: 150
+
+# 2.4.131 runtime block — the ONE non-default this pod genuinely needs: Sena's
+# super-agent screening over a full pipeline can run long. Everything else stays
+# default (omission is meaningful; we do not pre-fill defaults). The `timeouts`
+# block is REJECTED by <=2.4.130 — it must land WITH the 2.4.131 floor.
+timeouts:
+  llm_hard_timeout_s: 300
 
 data_structures:
   Req:
@@ -115,118 +88,166 @@ data_structures:
       received_at_utc: { type: "string" }
     required: ["req_id", "title"]
 
+# ── Entry points — one per real-world trigger ────────────────────────────────
 entry_points:
   - name: "req_filed"
-    target: "req_intake_agent"
-    description: "Requisition opened in ATS"
-
+    target: "talent_coordinator_agent"
+    description: "A requisition is opened in the ATS — Cass opens the case."
+    condition: always
+  - name: "candidate_status"
+    target: "talent_coordinator_agent"
+    description: "Anyone asks 'where is this req / candidate?' — Cass answers from the case record."
+    condition: always
   - name: "referral_received"
     target: "resume_screener_agent"
-    description: "Referral candidate"
-
+    description: "A referral candidate arrives — screen straight away."
+    condition: always
   - name: "linkedin_inmail_reply"
     target: "correspondence_drafter_agent"
-    description: "Candidate replied to outreach"
-
+    description: "A candidate replied to outreach — draft the follow-up."
+    condition: always
   - name: "scheduled_pipeline_health"
     target: "recruiting_ops_agent"
-    description: "Top-of-funnel sweep against your ATS (+ funnel metrics on the same tick)"
-
-  - name: "manual_action"
+    description: "Top-of-funnel sweep against your ATS (+ funnel metrics on the same tick)."
+    condition: always
+  - name: "manual_sourcing"
     target: "sourcing_agent"
-    description: "Recruiter-initiated sourcing pull from your ATS / LinkedIn Recruiter"
-
+    description: "Recruiter-initiated sourcing pull from your ATS / LinkedIn Recruiter."
+    condition: always
   - name: "candidate_stage_update"
     target: "recruiting_ops_agent"
-    description: "Record one candidate stage transition in your ATS (ingest mode)"
-
+    description: "Record one candidate stage transition in your ATS (ingest mode)."
+    condition: always
   - name: "funnel_metrics_report"
     target: "recruiting_ops_agent"
-    description: "Read funnel metrics across active reqs from your ATS (report mode)"
-
+    description: "Read funnel metrics across active reqs from your ATS (report mode)."
+    condition: always
   - name: "design_interview_loop"
     target: "interview_coordinator_agent"
-    description: "Design a tailored interview loop for a req (clean loops route to panel_booker_agent)"
-
+    description: "Design a tailored interview loop for a req (clean loops route to panel_booker_agent)."
+    condition: always
   - name: "candidate_rejection"
     target: "correspondence_drafter_agent"
-    description: "Candidate rejection — draft personalised letter (closes loop)"
-
+    description: "Candidate rejection — draft a personalised letter (closes the loop)."
+    condition: always
   - name: "post_onsite_reject"
     target: "correspondence_drafter_agent"
-    description: "Onsite-stage reject — longer, more specific feedback letter"
-
+    description: "Onsite-stage reject — longer, more specific feedback letter."
+    condition: always
   - name: "ghosted_candidate_close"
     target: "correspondence_drafter_agent"
-    description: "Candidate went silent 14+ days — polite close-out letter"
-
-
-# ── Direct-call entry points (every non-human, non-terminal
-#    agent is API-addressable; bypasses the upstream chain).
-#    Use for ad-hoc invocation, debugging, programmatic ingest.
-  - name: "direct_call_interview_coordinator"
-    target: "interview_coordinator_agent"
-    description: "On-demand direct call to the interview coordinator (llm) — bypasses upstream chain; clean loops route to panel_booker_agent"
-
-  - name: "direct_call_correspondence_drafter"
-    target: "correspondence_drafter_agent"
-    description: "On-demand direct call to the correspondence drafter (llm) — bypasses upstream chain; mode inferred from input (or pass correspondence_type)"
-
-  # ── Lyzr-inspired agents (added in 2.3.x) ──
+    description: "Candidate went silent 14+ days — polite close-out letter."
+    condition: always
   - name: "async_screen_interview"
     target: "hiring_assistant_agent"
-    description: "First-round async screen interview — rubric scoring → advance/borderline/decline"
-
+    description: "First-round async screen interview — rubric scoring -> advance / borderline / decline."
+    condition: always
   - name: "weekly_bias_audit"
     target: "bias_audit_agent"
-    description: "Sunday cron — EEOC 4/5ths-rule audit on screening decisions"
+    description: "Sunday cron — EEOC 4/5ths-rule audit on screening decisions."
+    condition: always
 
+  # ── HITL resume — a human answers / decides and the chain continues ──
+  - name: "recruiter_reply"
+    target: "recruiter_human"
+    description: "HITL resume — the recruiter answers or releases a flagged loop to booking."
+    condition: always
+  - name: "hiring_manager_reply"
+    target: "hiring_manager_human"
+    description: "HITL resume — the hiring manager approves or holds an offer."
+    condition: always
+
+  # ── Direct-call entry points (ad-hoc invocation / debugging) ──
+  - name: "direct_call_interview_coordinator"
+    target: "interview_coordinator_agent"
+    description: "On-demand direct call to the interview coordinator — bypasses the upstream chain."
+    condition: always
+  - name: "direct_call_correspondence_drafter"
+    target: "correspondence_drafter_agent"
+    description: "On-demand direct call to the correspondence drafter — mode inferred from input."
+    condition: always
 
 agents:
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Cass — Talent Coordinator (AI). Owns the case end to end: opens it,
+  # orchestrates the pod, keeps live status, is the requisition's one contact.
+  # Pure orchestration — never screens a resume, never approves. (Pure YAML.)
+  # ─────────────────────────────────────────────────────────────────────────
+  talent_coordinator_agent:
+    name: "talent_coordinator_agent"
+    communication_type: "chain"
+    agent_type: "llm"
+    model: "gpt-4o-mini"
+    temperature: 0.1
+    description: "Talent Coordinator — opens the case, orchestrates, keeps status, single point of contact."
+    prompt: |
+      You are Cass, the Talent Coordinator. You OWN each requisition from the
+      moment it is filed to the moment a candidate is hired. You orchestrate the
+      pod and keep everyone informed — you never screen a resume, design a loop,
+      or approve an offer yourself.
+
+      On a new requisition: open the case, record the filing time, hand it to
+      intake. On a status ask: answer the current stage / waiting-on / next gate
+      from the case record — nothing invented. Route any specialist exception to
+      the recruiter; never make the policy call yourself.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"action": "", "req_id": "", "stage": "", "waiting_on": "", "summary": ""}
+    yields:
+      action: "string"        # open_req | status | escalate
+      req_id: "string"
+      stage: "string"
+      waiting_on: "string"
+      summary: "string"
+    inputs:
+      payload: "object"
+    can_call:
+      - agent: "req_intake_agent"
+        condition: "calling_agent_response.action == 'open_req'"
+      - agent: "recruiter_human"
+        condition: "calling_agent_response.action == 'escalate'"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Intake — normalises the requisition, grounded in the ATS, held to a
+  # deterministic completeness floor (agency/req_intake_agent.py).
+  # ─────────────────────────────────────────────────────────────────────────
   req_intake_agent:
     name: "req_intake_agent"
     agent_type: "llm"
-    description: "Normalises the requisition"
+    description: "Normalises the requisition against the ATS; completeness floor holds it before sourcing"
     model: "gpt-4o-mini"
     temperature: 0.1
     max_tokens: 600
     communication_type: "chain"
     prompt: |
-      Normalise the req. context["prepared_data"]["context"] carries any
-      PRIOR req with this req_id, any likely DUPLICATE open req with the
-      same title, and the CONFIRMED salary band of record — pre_compose
-      pulled them from the ATS. Use them: echo the band of record when it
-      is confirmed, and surface a duplicate so the recruiter reconciles it
-      before sourcing twice.
+      Normalise the req. context["prepared_data"]["context"] carries any PRIOR
+      req with this req_id, any likely DUPLICATE open req with the same title,
+      and the CONFIRMED salary band of record — pre_compose pulled them from the
+      ATS. Use them: echo the band of record when it is confirmed, and surface a
+      duplicate so the recruiter reconciles it before sourcing twice.
 
-      Extract title, level (jr/mid/sr/staff/principal), location, salary
-      band (cents). Never invent a salary band — set both band fields to 0
-      if neither the req nor the band of record confirms one (HRBP fills
-      it in).
+      Extract title, level (jr/mid/sr/staff/principal), location, salary band
+      (cents). Never invent a salary band — set both band fields to 0 if neither
+      the req nor the band of record confirms one (HRBP fills it in).
 
       Return JSON with these keys (all required):
-        - req_id: string — if the input payload contains a req_id,
-          echo it VERBATIM; if missing, generate one in the form
-          "req-" followed by 10 random lowercase hex characters
+        - req_id: string — echo the input req_id VERBATIM if present; else
+          generate one as "req-" + 10 random lowercase hex characters
         - title: string (empty string if not stated — never invent)
         - level: string
         - location: string
         - salary_band_low_cents: number
         - salary_band_high_cents: number
-        - duplicate_req_id: string — the req_id of the duplicate open req
-          from context, else ""
-        - prior_req_id: string — the req_id of the prior req on file from
-          context, else ""
-        - req_complete: boolean — your best read of whether the req has a
-          title, a recognised level, and a confirmed band
+        - duplicate_req_id: string — the duplicate open req from context, else ""
+        - prior_req_id: string — the prior req on file from context, else ""
+        - req_complete: boolean — your best read of completeness
         - missing_fields: list — fields still missing (title/level/salary_band)
 
-      HARD RULE (your post-processor RE-ENFORCES this — it is a floor, not
-      a suggestion): req_complete and missing_fields are RECOMPUTED from
-      the normalised req. A req missing title, level, or a CONFIRMED band
-      (a 0/0 band counts as missing) is FORCED incomplete and routed to
-      the recruiter — it can never reach sourcing.
+      HARD RULE (your post-processor RE-ENFORCES this): req_complete and
+      missing_fields are RECOMPUTED from the normalised req. A req missing title,
+      level, or a CONFIRMED band (a 0/0 band counts as missing) is FORCED
+      incomplete and routed to the recruiter — it can never reach sourcing.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"req_id": "", "title": "", "level": "", "location": "", "salary_band_low_cents": 0, "salary_band_high_cents": 0, "duplicate_req_id": "", "prior_req_id": "", "req_complete": false, "missing_fields": []}
@@ -245,34 +266,25 @@ agents:
       missing_fields: "list"
     inputs:
       payload: "object"
+      upstream_yields: "object"
     can_call:
-      # Only a COMPLETE req (title + level + confirmed band — the @chain
-      # completeness floor sets req_complete) is worth sourcing against;
-      # an underspecified req would query the ATS blind / source against
-      # an unconfirmed band.
+      # Only a COMPLETE req (title + level + confirmed band) is worth sourcing.
       - agent: "sourcing_agent"
         condition: "calling_agent_response.req_complete == true"
-
-      # An incomplete req is malformed — route to the recruiter to fix
-      # the intake rather than source blind (mutually exclusive with the
-      # sourcing edge above; the @chain floor guarantees this fires).
+      # An incomplete req is malformed — route to the recruiter to fix intake.
       - agent: "recruiter_human"
         condition: "calling_agent_response.req_complete == false"
     narration: |
-      If the requisition is incomplete (missing title, level, or a
-      confirmed salary band), it is malformed — route to recruiter_human
-      to fix the intake rather than sourcing blind.
+      If the requisition is incomplete (missing title, level, or a confirmed
+      salary band), it is malformed — route to recruiter_human to fix the intake
+      rather than sourcing blind.
 
-  # ────────────────────────────────────────────────────────────
-  # sourcing_agent — connector-only (YAML-first restructure):
-  # candidates live in YOUR sourcing systems, not in template
-  # code. Point the webhook at an n8n workflow that queries your
-  # ATS candidate search (Greenhouse / Lever / Ashby) and/or
-  # LinkedIn Recruiter, and returns:
-  #   {"candidates_found": <int>, "candidate_ids": [...]}
-  # Connector-returned fields count as this agent's yields, so the
-  # outbound condition below evaluates normally.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Sourcing — connector-only actuator: candidates live in YOUR ATS / LinkedIn
+  # Recruiter, not in template code. Point the webhook at an n8n workflow that
+  # queries candidate search and returns {"candidates_found": <int>,
+  # "candidate_ids": [...]}. Inert (${VAR:} empty-defaults) until wired.
+  # ─────────────────────────────────────────────────────────────────────────
   sourcing_agent:
     name: "sourcing_agent"
     agent_type: "programmatic"
@@ -280,77 +292,88 @@ agents:
     communication_type: "chain"
     integration: "n8n"
     connector_config:
-      # Your ATS / LinkedIn candidate-search workflow URL
       webhook_url: "${N8N_SOURCING_WEBHOOK_URL:}"
       auth_token: "${N8N_AUTH_TOKEN:}"
     yields:
       candidates_found: "number"
       candidate_ids: "list"
-      req_id: "string"        # Identity passthrough — the screener's
-                              # @pre_compose pulls the pipeline by req_id.
+      req_id: "string"        # identity passthrough for the screener
     inputs:
       req_id: "string"
       title: "string"
     can_call:
-      # Only a non-empty pipeline is worth screening.
       - agent: "resume_screener_agent"
         condition: "calling_agent_response.candidates_found > 0"
-
-      # An empty top-of-funnel needs a human to widen criteria or
-      # approve external sourcing spend (mutually exclusive above).
       - agent: "recruiter_human"
         condition: "calling_agent_response.candidates_found == 0"
     narration: |
-      If the connector returns zero candidates the top of funnel is
-      empty — route to recruiter_human to widen the search criteria
-      or approve an external sourcing spend.
+      If the connector returns zero candidates the top of funnel is empty —
+      route to recruiter_human to widen the search criteria or approve an
+      external sourcing spend.
 
+  # ─────────────────────────────────────────────────────────────────────────
+  # Sena — Screening Analyst (AI, Super-Agent). Reads the candidate pipeline
+  # for a req with a fit score per candidate, screening ONLY on skills +
+  # experience. This is where the first compliance gate is won: a shortlist that
+  # leans on a bias-prone signal (name / school prestige / photo / address) is
+  # FORCED to the HRBP; a thin pipeline is re-sourced, never waved through.
+  #
+  #   super_agent = autonomous plan/execute/verify across many candidates.
+  #   instances   = fan the backlog across parallel copies; each copy CLAIMS a
+  #                 disjoint batch (claim_candidate_batch) so copies never
+  #                 duplicate work. instances_handoff: last COMBINES the copies —
+  #                 the shortlists CONCATENATE, and the @chain floor RECOMPUTES
+  #                 avg_fit_score from the combined shortlist (so the number-sum
+  #                 merge footgun never bites — see nuances #Parallel instances).
+  #   @chain      = the bias + score floor (agency/resume_screener_agent.py).
+  # Tools are the day-0 dev store; the ATS mcp block below is the live path.
+  # ─────────────────────────────────────────────────────────────────────────
   resume_screener_agent:
     name: "resume_screener_agent"
     agent_type: "llm"
-    description: "Filters candidates against req"
-    model: "gpt-4o-mini"
+    description: "Screening Analyst — screens the pipeline against the req on skills + experience; bias + score floors"
+    model: "claude-sonnet-4-6"
     temperature: 0.0
-    max_tokens: 1000
+    max_completion_tokens: 1500
+    max_tool_calls_per_message: 15   # a full pipeline is many candidates; default 5 truncates silently
     communication_type: "chain"
+    super_agent:                     # DICT form = the tuning path (2.4.123+); the ONLY way to tune it
+      cost_ceiling: 120000
+      wall_clock: 900
+    instances: 3                     # fan the backlog across 3 parallel copies
+    instances_handoff: last          # COMBINE the copies -> one shortlist; @chain recomputes the ratio
     prompt: |
-      Score each candidate. context["prepared_data"]["context"] carries the
-      req spec + the actual candidate pipeline (resume data + any prior
-      screens) — pre_compose pulled them from the ATS. Reason over the REAL
-      candidates, scoring ONLY on skills + experience.
+      You are Sena, the Screening Analyst. Turn a candidate pipeline into a
+      shortlist scored ONLY on skills + experience — and REFUSE to lean on a
+      bias-prone signal. First CLAIM your batch: call claim_candidate_batch with
+      the req_id to pull a disjoint set of candidates (so parallel copies of you
+      never screen the same person), then get_req_spec for the bar and
+      get_candidate for each claimed candidate's record. Score each on skills +
+      experience against the spec.
 
-      Return JSON with these keys:
-        - shortlist: list of {candidate_id, fit_score, top_reason}.
-          top_reason MUST cite a skill or experience — NEVER a name,
-          school prestige, photo, or address.
-        - bias_signal: true if you found yourself relying on name /
-          school prestige / photo / address (rather than skills + experience)
-        - avg_fit_score: 0..1 average across shortlist
-        - recruiter_briefing: 3 sentence narrative for the recruiter.
-          Lead with shortlist size + avg fit. Note bias signal if true.
-          Recommend outreach drafting OR re-source if pipeline thin.
-        - re_source_required: true if the pipeline is too thin/weak to
-          advance to outreach (your post-processor enforces this floor).
+      NEVER score on a name, school prestige, a photo, or an address. A
+      top_reason MUST cite a skill or an experience. If you catch yourself
+      leaning on a bias-prone signal, say so — bias_signal is the HRBP's gate.
+      Load the `screen` playbook for the exact read-and-score order.
 
-      HARD RULES (your post-processor RE-ENFORCES these — they are floors,
-      not suggestions):
-        - avg_fit_score is RECOMPUTED from the shortlist fit_scores; if
-          the shortlist is empty it is 0.
-        - bias_signal is FORCED true if any top_reason / briefing leans on
-          a bias-prone signal (name, school prestige, photo, address) —
-          the floor overrides your self-report.
-        - re_source_required is FORCED true when the shortlist has fewer
-          than 3 candidates or the recomputed avg fit is below 0.55.
+      Return JSON with these keys (all required):
+        - shortlist: list of {candidate_id, fit_score, top_reason}
+        - bias_signal: boolean — true if any reason leaned on name / school /
+          photo / address rather than skills + experience
+        - avg_fit_score: 0..1 average across the shortlist
+        - recruiter_briefing: 3-sentence narrative (shortlist size + avg fit;
+          note bias if true; recommend outreach OR re-source if thin)
+        - re_source_required: boolean — pipeline too thin/weak to advance
+
+      HARD RULES (your post-processor RE-ENFORCES these — they are floors):
+        - avg_fit_score is RECOMPUTED from the shortlist fit_scores (0 if empty).
+        - bias_signal is FORCED true if any reason leans on a bias-prone signal.
+        - re_source_required is FORCED true when the shortlist has fewer than 3
+          candidates or the recomputed avg fit is below 0.55.
         - recruiter_briefing must NEVER be empty.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"shortlist": [], "bias_signal": false, "avg_fit_score": 0, "recruiter_briefing": "", "re_source_required": false}
-    enforce_yields: true
-    enforce_yields_retry: 2
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "screening_rubric"
     yields:
       shortlist: "list"
       bias_signal: "boolean"
@@ -360,121 +383,139 @@ agents:
     inputs:
       upstream_yields: "object"
       req_id: "string"
+    # Playbook — the CRAFT, fetched on demand. Only `description` rides in the
+    # prompt; `responsibility` is loaded when the model recognises the intent.
+    playbook:
+      - intent: screen
+        description: "How to screen a candidate pipeline against a req without bias."
+        responsibility: |
+          1. CLAIM your batch FIRST (claim_candidate_batch by req_id) so parallel
+             copies of you never score the same candidate — then pull the req
+             spec and each claimed candidate's record.
+          2. Score every candidate on SKILLS + EXPERIENCE only. Write a
+             top_reason that cites a concrete skill or experience — never a name,
+             a school, a photo, or an address.
+          3. If a resume forces you to guess on the bar (missing skills data),
+             leave the candidate OFF the shortlist rather than inventing a score.
+          4. If your own reasoning starts leaning on a bias-prone signal, set
+             bias_signal true — the HRBP reviews it; you do not waive it.
+        variables: [req_id]
+    # Skills — reusable instruction blocks loaded on demand via
+    # load_skill_reference. `bias` is the always-relevant screening skill.
+    # Register the source (see README): filesystem source -> ./skills.
+    skills:
+      sourceName: "recruiting_playbooks"
+      enabled: true
+      names: [bias]
+    # Day-0 tool surface — reads the seed pipeline so the pod runs with NO
+    # connector wired. Each tool announces itself (available:false) when it has
+    # no real source. See agency/tools.py.
+    tools: [claim_candidate_batch, get_req_spec, get_candidate]
+    tool_categories: [screening]
+    # ── To wire a real ATS, uncomment and set the URL (each named action under
+    #    `use:` becomes its own tool, e.g. greenhouse_search_candidates). NOTE:
+    #    the SDK rejects an http mcp block with an EMPTY url at load, so this
+    #    ships COMMENTED — fill the URL, then uncomment. ──
+    # mcp:
+    #   - transport: http
+    #     url: "${ATS_MCP_URL}"
+    #     token: "${ATS_MCP_TOKEN:}"
+    #     use: [search_candidates, get_candidate, get_job]
+    #     name: greenhouse
+    #     timeout: 30
     can_call:
-      # Bias is the HRBP's hard gate (deterministic @chain floor forces it).
+      # Bias is the HRBP's hard gate (the @chain floor forces bias_signal).
       - agent: "hrbp_human"
         condition: "calling_agent_response.bias_signal == true"
-
-      # Thin/weak pipeline → recruiter to widen criteria (the screen score
-      # floor; mutually exclusive with the outreach edge below).
+      # Thin/weak pipeline -> recruiter to widen criteria (mutually exclusive).
       - agent: "recruiter_human"
         condition: "calling_agent_response.bias_signal == false and calling_agent_response.re_source_required == true"
-
-      # Clean, deep-enough pipeline → draft outreach.
+      # Clean, deep-enough pipeline -> draft outreach.
       - agent: "correspondence_drafter_agent"
         condition: "calling_agent_response.bias_signal == false and calling_agent_response.re_source_required == false"
 
-  # ────────────────────────────────────────────────────────────
-  # correspondence_drafter_agent — ALL candidate correspondence
-  # (2.3.x consolidation: absorbed the outreach, offer and
-  # rejection-letter drafters — three thin mode-variants of one
-  # candidate-correspondence writer). Mode is inferred from input:
-  # an explicit correspondence_type field wins; else offer terms
-  # present → offer; decline / rejection / ghosted-close context
-  # → rejection; else outreach.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Correspondence — ALL candidate correspondence (outreach / offer / rejection).
+  # Mode inferred from input. The salary-band gate and the rejection-
+  # personalisation floor are enforced in code (agency/correspondence_drafter_agent.py).
+  # skills: house `tone` is eager (always resident — every letter needs it);
+  # `bias` is lazy (fetched when the rejection reasoning needs it).
+  # playbook: `reject` — how to close a loop without burning the bridge.
+  # ─────────────────────────────────────────────────────────────────────────
   correspondence_drafter_agent:
     name: "correspondence_drafter_agent"
     agent_type: "llm"
-    description: "Drafts all candidate correspondence — outreach, offers (band-enforced), rejection letters (bridge-preserving)"
-    # model: kept claude-sonnet-4-6 from the offer mode — the
-    # highest-stakes correspondence keeps the stronger drafter.
+    description: "Drafts all candidate correspondence — outreach, offers (band-enforced), rejections (bridge-preserving)"
     model: "claude-sonnet-4-6"
     temperature: 0.2
     max_completion_tokens: 2000
     communication_type: "chain"
     prompt: |
-      You draft ALL candidate correspondence for this recruiting mesh.
-      First decide the mode and return it as correspondence_type:
+      You draft ALL candidate correspondence for this recruiting mesh. First
+      decide the mode and return it as correspondence_type:
         - an explicit correspondence_type in the input always wins
-        - offer terms present (base / equity / signing bonus,
-          stage == offer) → "offer"
-        - decline / rejection / ghosted-close context → "rejection"
-        - otherwise → "outreach"
+        - offer terms present (base / equity / signing bonus, stage == offer)
+          -> "offer"
+        - decline / rejection / ghosted-close context -> "rejection"
+        - otherwise -> "outreach"
 
-      MODE outreach — personalised candidate outreach:
-        Be specific (cite their experience / recent project / company
-        growth). Never make claims about salary, remote-flexibility,
-        equity unless the req confirms them.
-        Fill: message_body, cited_signals.
+      MODE outreach — personalised candidate outreach. Be specific (cite their
+      experience / recent project). Never claim salary, remote-flex, or equity
+      unless the req confirms them. Fill: message_body, cited_signals.
 
-      MODE offer — offer letter:
-        context["prepared_data"]["context"] carries the req's CONFIRMED
-        salary band + the candidate record — pre_compose pulled them from
-        the ATS. Must fit within the band. Set offer_amount_cents to the
-        figure you are offering (cents). If the candidate ask is outside
-        the band, surface it — do NOT exceed the band; set within_band=false
-        and requires_hrbp_review=true. (Your post-processor RECOMPUTES
-        within_band from the band of record — an unconfirmed 0/0 band fails
-        closed to HRBP.)
-        Fill: offer_body, offer_amount_cents, within_band, requires_hrbp_review.
+      MODE offer — offer letter. context["prepared_data"]["context"] carries the
+      req's CONFIRMED salary band + the candidate record (pre_compose pulled
+      them). Must fit within the band. Set offer_amount_cents (cents). If the ask
+      is outside the band, surface it — do NOT exceed the band; set
+      within_band=false and requires_hrbp_review=true. (Your post-processor
+      RECOMPUTES within_band from the band of record; an unconfirmed 0/0 band
+      fails closed to HRBP.) Fill: offer_body, offer_amount_cents, within_band,
+      requires_hrbp_review.
 
-      MODE rejection — personalised rejection that closes the loop
-      without burning the bridge:
-        - Acknowledges the specific role they applied for
-        - References something specific from their background or
-          interview (NOT just templated)
-        - Gives ONE specific reason if possible (skills gap, role
-          went to another candidate, role on hold) — never lie
-        - Invites them to apply to other roles if appropriate
-        - Closes warmly
-        A bad rejection costs Glassdoor reputation; a no-response
-        costs future applicants. Specificity is the trust signal.
-        Fill: candidate_facing_message (warm, specific, 2-3 short
-        paragraphs), rejection_stage (screen | interview |
-        final_round | offer_declined), reason_class (skills_gap |
-        culture_fit | role_filled | role_on_hold | competing_offer |
-        other), personalisation_signal (the specific reference used),
-        alternate_roles_suggested (list of role IDs if appropriate),
-        requires_recruiter_review (true if (a) interviewed candidate,
-        (b) referred by employee, (c) close to offer).
+      MODE rejection — personalised rejection that closes the loop without
+      burning the bridge. Load the `reject` playbook for the craft. Fill:
+      candidate_facing_message (warm, specific, 2-3 short paragraphs),
+      rejection_stage (screen | interview | final_round | offer_declined),
+      reason_class (skills_gap | culture_fit | role_filled | role_on_hold |
+      competing_offer | other), personalisation_signal (the specific reference
+      used), alternate_roles_suggested (list), requires_recruiter_review.
 
-      Return ONE JSON object with ALL of these keys — use empty /
-      neutral values for the modes that don't apply:
-        correspondence_type, message_body, cited_signals, offer_body,
-        offer_amount_cents, within_band, requires_hrbp_review,
-        candidate_facing_message, rejection_stage, reason_class,
-        personalisation_signal, alternate_roles_suggested,
-        requires_recruiter_review, req_id
+      Return ONE JSON object with ALL keys — empty/neutral values for the modes
+      that don't apply.
 
       HARD RULES (apply AFTER drafting — they override your judgment):
-        - correspondence_type MUST be exactly one of: outreach,
-          offer, rejection.
-        - OFFER: if within_band is false, requires_hrbp_review MUST
-          be true — an out-of-band offer is never sent without HRBP.
-        - REJECTION: rejection_stage MUST be one of screen,
-          interview, final_round, offer_declined (use "screen" when
-          unsure). reason_class MUST be one of skills_gap,
-          culture_fit, role_filled, role_on_hold, competing_offer,
-          other (use "other" when unsure).
-        - REJECTION: requires_recruiter_review MUST be true when ANY
-          of these hold: (a) rejection_stage is interview,
-          final_round or offer_declined; (b) personalisation_signal
-          is empty — a letter you could not personalise never goes
-          out unreviewed; (c) candidate_facing_message is shorter
-          than 120 characters — too short to be specific.
+        - correspondence_type MUST be exactly one of: outreach, offer, rejection.
+        - OFFER: if within_band is false, requires_hrbp_review MUST be true.
+        - REJECTION: rejection_stage MUST be one of screen, interview,
+          final_round, offer_declined (use "screen" when unsure). reason_class
+          MUST be one of skills_gap, culture_fit, role_filled, role_on_hold,
+          competing_offer, other (use "other" when unsure).
+        - REJECTION: requires_recruiter_review MUST be true when ANY hold: (a)
+          rejection_stage is interview/final_round/offer_declined; (b)
+          personalisation_signal is empty; (c) candidate_facing_message is
+          shorter than 120 characters.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"correspondence_type": "", "message_body": "", "cited_signals": [], "offer_body": "", "offer_amount_cents": 0, "within_band": false, "requires_hrbp_review": false, "candidate_facing_message": "", "rejection_stage": "", "reason_class": "", "personalisation_signal": "", "alternate_roles_suggested": [], "requires_recruiter_review": false, "req_id": ""}
     enforce_yields: true
     enforce_yields_retry: 1
-    # knowledge: kept offer_templates (salary-band policy is the
-    # highest-risk correspondence); merge the rejection_templates
-    # rows into it. The outreach mode had no knowledge group.
-    knowledge:
-      serviceName: "mongo_main"
+    skills:
+      sourceName: "recruiting_playbooks"
       enabled: true
-      groupName: "offer_templates"
+      names: [bias, tone]
+      eager: [tone]                 # house tone rides resident; bias stays lazy
+    playbook:
+      - intent: reject
+        description: "How to write a rejection that closes the loop without burning the bridge."
+        responsibility: |
+          1. Acknowledge the specific role and reference something concrete from
+             their background or interview — never a template.
+          2. Give ONE honest, specific reason if you can (skills gap, role went
+             to another candidate, role on hold) — never lie.
+          3. Invite them to apply to other roles when appropriate; close warmly.
+          4. A rejection you could NOT personalise never goes out unreviewed —
+             set requires_recruiter_review true.
+        variables: [req_id, candidate_id]
     yields:
       correspondence_type: "string"
       message_body: "string"
@@ -497,51 +538,272 @@ agents:
       req_id: "string"
       candidate_id: "string"
     can_call:
-      # outreach drafts go to the recruiter (was unconditional on the
-      # outreach mode); flagged rejections also land with the recruiter
+      # outreach + flagged rejections land with the recruiter.
       - agent: "recruiter_human"
         condition: "calling_agent_response.correspondence_type == 'outreach' or calling_agent_response.correspondence_type == 'rejection' and calling_agent_response.requires_recruiter_review == true"
-
-      # offer guardrail preserved: outside-band / flagged → HRBP
+      # offer guardrail: outside-band / flagged -> HRBP.
       - agent: "hrbp_human"
         condition: "calling_agent_response.correspondence_type == 'offer' and calling_agent_response.within_band == false or calling_agent_response.correspondence_type == 'offer' and calling_agent_response.requires_hrbp_review == true"
-
-      # clean offer → hiring-manager approval
+      # clean offer -> hiring-manager approval.
       - agent: "hiring_manager_human"
         condition: "calling_agent_response.correspondence_type == 'offer' and calling_agent_response.within_band == true and calling_agent_response.requires_hrbp_review == false"
-
-      # clean rejection → straight to the WORM audit log
+      # clean rejection -> straight to the WORM audit log.
       - agent: "recruiting_audit_logger_agent"
         condition: "calling_agent_response.correspondence_type == 'rejection' and calling_agent_response.requires_recruiter_review == false"
 
-  # ────────────────────────────────────────────────────────────
-  # recruiting_ops_agent — ONE recruiting-ops analyst, connector-only
-  # (YAML-first restructure: the SQLite stage ledger is gone — the
-  # funnel ledger lives in YOUR ATS, which is where it always lived
-  # in production). Point the webhook at an n8n workflow against
-  # your ATS (Greenhouse / Lever / Ashby). Three responsibilities,
-  # mode-dispatched by the "mode" input your workflow receives:
-  #   · sweep  — thin-funnel sweep across active reqs
-  #   · ingest — record one candidate stage transition in the ATS
-  #   · report — drop-off + time-to-offer/time-to-hire metrics
-  # The workflow must return the yields shape below; the SDK's
-  # lenient yields fill covers any keys a mode doesn't produce.
-  # ────────────────────────────────────────────────────────────
+  # ─────────────────────────────────────────────────────────────────────────
+  # Reed — Async Screen Interviewer (AI). First-round async screen; the weighted
+  # rubric score and the bias-flag gate are enforced as deterministic floors
+  # (agency/hiring_assistant_agent.py). A missing id is error_skipped, never an
+  # auto-decline.
+  # ─────────────────────────────────────────────────────────────────────────
+  hiring_assistant_agent:
+    name: "hiring_assistant_agent"
+    agent_type: "llm"
+    description: "First-round async screen — rubric scoring, transcript review, advance / borderline / decline"
+    model: "claude-sonnet-4-6"
+    temperature: 0.2
+    max_completion_tokens: 2500
+    communication_type: "chain"
+    prompt: |
+      Conduct (or score) the first-round screen interview. Score the
+      CONVERSATION, not the resume. context["prepared_data"]["context"] carries
+      the candidate record + their prior resume-screen score (pre_compose pulled
+      them). Measure how they think + speak.
+
+      NEVER ask about age, family status, religion, ethnicity, origin, or accent.
+      Decline-worthy by itself if you do.
+
+      Return JSON with these keys:
+        - screen_id: "screen-" + candidate_id + "-" + 10 random lowercase hex
+        - candidate_id, req_id: echo the input values VERBATIM
+        - rubric_scores: a LIST of {"dimension", "weight", "score"} covering
+          EXACTLY these five (score 0..1): technical_depth (0.30),
+          communication (0.20), problem_solving (0.20), role_motivation (0.15),
+          culture_fit_signals (0.15)
+        - weighted_score: sum of score x weight, clamped [0,1], 2 decimals
+        - recommendation: see hard rules
+        - bias_flags: forbidden topics that actually appeared; [] when none
+        - transcript_chars: character count of the excerpt scored (cap 5000)
+        - duration_minutes: integer
+        - requires_hrbp_review, requires_hiring_manager_review: see hard rules
+        - conducted_at_utc: current UTC time, ISO-8601
+
+      HARD RULES (deterministic — no judgment):
+        - recommendation = "advance" when weighted_score >= 0.70, "borderline"
+          when 0.55 <= weighted_score < 0.70, else "decline".
+        - MALFORMED PAYLOAD GUARD: if candidate_id or req_id is missing, set
+          recommendation to "error_skipped", both review flags false, screen_id
+          "" and every score 0 — never auto-decline on a malformed payload.
+        - requires_hrbp_review = true iff bias_flags is non-empty.
+        - requires_hiring_manager_review = true iff recommendation is "advance"
+          or "borderline".
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"screen_id": "", "candidate_id": "", "req_id": "", "rubric_scores": [], "weighted_score": 0, "recommendation": "", "bias_flags": [], "transcript_chars": 0, "duration_minutes": 0, "requires_hrbp_review": false, "requires_hiring_manager_review": false, "conducted_at_utc": ""}
+    enforce_yields: true
+    yields:
+      screen_id: "string"
+      candidate_id: "string"
+      req_id: "string"
+      rubric_scores: "list"
+      weighted_score: "number"
+      recommendation: "string"
+      bias_flags: "list"
+      transcript_chars: "number"
+      duration_minutes: "number"
+      requires_hrbp_review: "boolean"
+      requires_hiring_manager_review: "boolean"
+      conducted_at_utc: "string"
+    inputs:
+      upstream_yields: "object"
+      candidate_id: "string"
+      req_id: "string"
+    can_call:
+      # Bias signal -> HRBP hard gate (overrides the recommendation).
+      - agent: "hrbp_human"
+        condition: "calling_agent_response.requires_hrbp_review == true"
+      # advance / borderline -> hiring manager.
+      - agent: "hiring_manager_human"
+        condition: "calling_agent_response.requires_hiring_manager_review == true and calling_agent_response.requires_hrbp_review == false"
+      # decline -> rejection letter (correspondence drafter, rejection mode).
+      - agent: "correspondence_drafter_agent"
+        condition: "calling_agent_response.recommendation == 'decline' and calling_agent_response.requires_hrbp_review == false"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Ivo — Interview Coordinator (AI). Designs the interview loop; the duration
+  # cap, the mandatory HM debrief, and the diversity floor are enforced in code
+  # (agency/interview_coordinator_agent.py). Clean loops route straight to the
+  # calendar connector; flagged loops go to the recruiter unbooked.
+  # playbook: `schedule` — how to build a dimension-covering, diverse loop.
+  # ─────────────────────────────────────────────────────────────────────────
+  interview_coordinator_agent:
+    name: "interview_coordinator_agent"
+    agent_type: "llm"
+    description: "Designs the interview loop (dimension coverage + diversity-aware panel + duration cap); clean loops -> panel_booker_agent"
+    model: "gpt-4o-mini"
+    temperature: 0.2
+    max_tokens: 1500
+    communication_type: "chain"
+    prompt: |
+      You are Ivo, the interview coordinator: you design the interview loop for a
+      req. context["prepared_data"]["context"] carries the req's required
+      dimensions + the actual interviewer roster (with each panelist's level) —
+      pre_compose pulled them. Build the loop from THOSE real panelists. Clean
+      loops are booked automatically by the panel booker; flagged loops go to the
+      recruiter unbooked. Load the `schedule` playbook for the design order.
+
+      Return JSON with these keys (all required):
+        - req_id: echo the req_id VERBATIM
+        - role_level: the level from the input (use "mid" if absent)
+        - panels: list of {kind, title, duration_minutes, interviewer_role,
+          interviewer_level, dimension}
+        - total_minutes: sum of duration_minutes across panels
+        - dimensions_covered: sorted list of distinct panel dimensions
+        - panel_diversity_ok: boolean (see hard rules)
+        - requires_recruiter_review: boolean (see hard rules)
+        - loop_briefing: 2-sentence narrative (panels count, total minutes,
+          dimensions covered, whether panel diversity passed)
+
+      Cover each required dimension with exactly one panelist. Spread the
+      interviewer levels (at least two distinct levels).
+
+      HARD RULES (your post-processor RE-ENFORCES these):
+        - The whole loop MUST fit within 5 hours (300 minutes); the
+          post-processor drops panels from the back until it fits.
+        - A hiring-manager debrief slot is ALWAYS appended last.
+        - panel_diversity_ok is RECOMPUTED true ONLY when the panels span at
+          least two distinct non-empty interviewer_level values.
+        - requires_recruiter_review is FORCED true when panel_diversity_ok is
+          false OR total_minutes is under 120.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
+      {"req_id": "", "role_level": "", "panels": [], "total_minutes": 0, "dimensions_covered": [], "panel_diversity_ok": false, "requires_recruiter_review": false, "loop_briefing": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    playbook:
+      - intent: schedule
+        description: "How to design a dimension-covering, diversity-aware interview loop within the time cap."
+        responsibility: |
+          1. Pull the req's required dimensions and the real interviewer roster
+             FIRST — you cannot build a loop from panelists you have not read.
+          2. Cover each required dimension with exactly one panelist; no
+             double-coverage on the same skill.
+          3. Spread interviewer levels (>=2 distinct) — a single-level panel is a
+             bias risk and fails the diversity floor.
+          4. Keep the whole loop inside 5 hours and always leave room for the
+             30-minute hiring-manager debrief the floor appends last.
+        variables: [req_id, level]
+    yields:
+      req_id: "string"
+      role_level: "string"
+      panels: "list"
+      total_minutes: "number"
+      dimensions_covered: "list"
+      panel_diversity_ok: "boolean"
+      requires_recruiter_review: "boolean"
+      loop_briefing: "string"
+    inputs:
+      upstream_yields: "object"
+      req_id: "string"
+      level: "string"
+      candidate_id: "string"
+    can_call:
+      - agent: "recruiter_human"
+        condition: "calling_agent_response.requires_recruiter_review == true"
+      # Clean loop -> straight to the calendar connector.
+      - agent: "panel_booker_agent"
+        condition: "calling_agent_response.requires_recruiter_review == false"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Panel Booker — connector-only actuator: interviews are booked where
+  # interviews live (YOUR calendar / ATS scheduling). Point the webhook at an
+  # n8n workflow that creates the events and returns {"interviews_booked":
+  # <int>, "panel": [...]}. Sits behind the recruiter gate for flagged loops.
+  # ─────────────────────────────────────────────────────────────────────────
+  panel_booker_agent:
+    name: "panel_booker_agent"
+    agent_type: "programmatic"
+    description: "Books the approved interview panel into your calendar / ATS scheduling via connector"
+    communication_type: "execute"
+    integration: "n8n"
+    connector_config:
+      webhook_url: "${N8N_PANEL_BOOKING_WEBHOOK_URL:}"
+      auth_token: "${N8N_AUTH_TOKEN:}"
+    yields:
+      interviews_booked: "number"
+      panel: "list"
+    inputs:
+      req_id: "string"
+      panels: "list"
+    can_call:
+      # A real booking is a fact worth a WORM entry.
+      - agent: "recruiting_audit_logger_agent"
+        condition: "calling_agent_response.interviews_booked > 0"
+      # Nothing booked -> the connector failed; recruiter books manually.
+      - agent: "recruiter_human"
+        condition: "calling_agent_response.interviews_booked == 0"
+    narration: |
+      If the calendar connector booked nothing (interviews_booked == 0) the
+      booking failed — route to recruiter_human to book the panel manually.
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Ora — Offer Issuer (programmatic FINISHER). Sits BEHIND the hiring-manager
+  # approval gate. It never approves — it re-checks that a human actually
+  # approved (allow-token allowlist + block-token denylist; an UNKNOWN verdict
+  # fails closed), re-derives within_band from the band of record (a human can't
+  # waive it), renders the real offer letter to ./out, DELETES the partial on a
+  # tripped floor, records an append-only ledger entry, and recovers the offer
+  # across the HITL boundary from the session stash / dev store. Never issues an
+  # offer nobody approved and never fakes a real ack.
+  # See agency/offer_issuer_agent.py for the enforce-issuance floor.
+  # ─────────────────────────────────────────────────────────────────────────
+  offer_issuer_agent:
+    name: "offer_issuer_agent"
+    agent_type: "programmatic"
+    communication_type: "chain"
+    description: "Offer Issuer — re-checks approval, re-derives band, renders the offer letter, WORM ledger; fails closed"
+    yields:
+      approved: "boolean"
+      issued: "boolean"
+      within_band: "boolean"
+      offer_letter_path: "string"
+      status: "string"          # issued | blocked
+      block_reasons: "array"
+    inputs:
+      upstream_yields: "object"
+      req_id: "string"
+      candidate_id: "string"
+    can_call:
+      - agent: "recruiting_audit_logger_agent"
+        condition: "always"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Recruiting Ops — connector-only funnel analyst: the funnel/stage ledger
+  # lives in YOUR ATS. Mode-dispatched (sweep / ingest / report) by the "mode"
+  # input. Returns the yields shape below; the SDK's lenient yields fill covers
+  # any key a mode doesn't produce.
+  # ─────────────────────────────────────────────────────────────────────────
   recruiting_ops_agent:
     name: "recruiting_ops_agent"
     agent_type: "programmatic"
     description: "Recruiting-ops analyst — thin-funnel sweep + stage / time-to-hire metrics read from your ATS"
     communication_type: "execute"
-    # wake_up: "0 9 * * *"   # enable after wiring your ATS connector
     integration: "n8n"
+    # ── Scheduled sweep — enable AFTER wiring the ATS connector. When you do,
+    #    keep the `timezone` line so it fires in your business timezone, NOT UTC
+    #    (a bare cron runs in UTC — nuances #13). ──
+    # wake_up: "0 9 * * 1-5"
+    # timezone: "America/New_York"
     connector_config:
-      # Your ATS funnel/ledger workflow URL
       webhook_url: "${N8N_ATS_FUNNEL_WEBHOOK_URL:}"
       auth_token: "${N8N_AUTH_TOKEN:}"
     yields:
       thin_reqs: "list"
       escalate: "boolean"
-      req_id: "string"        # Identity passthrough — manager sees WHICH req is thin
+      req_id: "string"
       mode: "string"
       horizon_days: "number"
       stage_counts: "object"
@@ -561,144 +823,171 @@ agents:
     can_call:
       - agent: "recruiting_manager_human"
         condition: "calling_agent_response.escalate == true"
-
-      # Funnel needs working, not management attention: a recruiter
-      # action without a thin-req escalation goes to the recruiter
-      # (mutually exclusive with the manager escalation above).
       - agent: "recruiter_human"
         condition: "calling_agent_response.requires_recruiter_action == true and calling_agent_response.escalate == false"
     narration: |
-      If requires_recruiter_action is true (slow median time-to-hire
-      or a sharp phone-screen → onsite drop-off) without a thin-req
-      escalation, route to recruiter_human — the funnel needs working,
-      not management attention.
-
+      If requires_recruiter_action is true (slow median time-to-hire or a sharp
+      phone-screen -> onsite drop-off) without a thin-req escalation, route to
+      recruiter_human — the funnel needs working, not management attention.
     auto_store_response: true
     auto_store_yields: true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Bias Audit — weekly EEOC 4/5ths-rule adverse-impact audit. KEEPS its Python
+  # module (compliance-grade domain math stays deterministic code). Scheduled
+  # weekly IN THE BUSINESS TIMEZONE (a bare cron would fire in UTC).
+  # ─────────────────────────────────────────────────────────────────────────
+  bias_audit_agent:
+    name: "bias_audit_agent"
+    agent_type: "programmatic"
+    description: "Weekly batch audit on screening decisions — EEOC 4/5ths rule on each demographic dimension"
+    communication_type: "chain"
+    wake_up: "0 8 * * 0"             # Sunday 08:00 ...
+    timezone: "America/New_York"     # ... in the business timezone, NOT UTC
+    wake_up_input:
+      trigger: weekly_bias_audit
+    yields:
+      action: "string"
+      window_start_utc: "string"
+      window_end_utc: "string"
+      decisions_audited: "number"
+      findings: "list"
+      adverse_impact_count: "number"
+      requires_hrbp_review: "boolean"
+      generated_at_utc: "string"
+    inputs:
+      decisions: "list"
+      window_days: "number"
+    narration: |
+      EEOC 4/5ths rule: a group's selection rate must be >=80% of the highest
+      group's rate. Below that -> adverse impact finding. Minimum sample 5 per
+      group to compare.
+    can_call:
+      - agent: "hrbp_human"
+        condition: "calling_agent_response.requires_hrbp_review == true"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Human members — first-class, reached in the channel they already live in.
+  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
+  # `dual` belongs on the human/webhook boundary agent ONLY — every downstream
+  # target here is a NON-human (chain / execute), so no dual<->dual ping-pong.
+  # ─────────────────────────────────────────────────────────────────────────
 
   recruiter_human:
     name: "recruiter_human"
     agent_type: "human"
-    is_human_powered: true
-    description: "Recruiter — reviews outreach + shortlists"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 7200
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    description: "Recruiter — reviews outreach + shortlists, releases flagged loops to booking."
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_manager"
-      message: "escalate_to_manager"
-      note: "Recruiter didn't respond — manager escalation"
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+      max_retries: 1
+      retry_delay: 2
     yields:
-      decision: "string"
-      notes: "string"
+      human_message: "string"
     inputs:
       req_id: "string"
     can_call:
-      - agent: "recruiting_manager_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_manager'"
-
-      # Recruiter approved a flagged interview loop → book it now
-      # (the approval is also recorded by the audit edge below).
+      # Recruiter released a flagged interview loop -> book it now.
       - agent: "panel_booker_agent"
         condition: "calling_agent_response.human_message == 'book_panel'"
-
+      # Silence / hold / any non-book reply is recorded; the Manager SUPERVISOR
+      # escalates from here (manager.escalation -> HRBP) — no human->human wire.
       - agent: "recruiting_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_manager'"
+        condition: "calling_agent_response.human_message != 'book_panel'"
 
   hiring_manager_human:
     name: "hiring_manager_human"
     agent_type: "human"
-    is_human_powered: true
-    description: "Hiring manager — final offer approval"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 14400
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    description: "Hiring manager — final offer approval; an approved offer is issued by Ora."
     fallback_on_timeout: true
     fallback_response:
-      decision: "escalate_to_hrbp"
-      message: "escalate_to_hrbp"
-      note: "Hiring manager didn't respond — HRBP escalation"
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
     yields:
-      decision: "string"
-      notes: "string"
+      human_message: "string"       # approved | rejected | held_for_review
     inputs:
       req_id: "string"
     can_call:
-      - agent: "hrbp_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_hrbp'"
-
+      # Approved -> the finisher issues the offer (which re-checks approval).
+      - agent: "offer_issuer_agent"
+        condition: "calling_agent_response.human_message == 'approved'"
+      # Anything else (hold / reject / silence) is recorded; Manager escalates.
       - agent: "recruiting_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_hrbp'"
-
-  recruiting_manager_human:
-    name: "recruiting_manager_human"
-    agent_type: "human"
-    is_human_powered: true
-    description: "Recruiting manager — team escalation"
-    human_interface: "default"
-    communication_type: "dual"
-    human_timeout_seconds: 14400
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
-    fallback_on_timeout: true
-    fallback_response:
-      decision: "escalate_to_hrbp"
-      message: "escalate_to_hrbp"
-      note: "Recruiting manager didn't respond — HRBP"
-    yields:
-      decision: "string"
-      notes: "string"
-    inputs:
-      req_id: "string"
-    can_call:
-      - agent: "hrbp_human"
-        condition: "calling_agent_response.human_message == 'escalate_to_hrbp'"
-
-      - agent: "recruiting_audit_logger_agent"
-        condition: "calling_agent_response.human_message != 'escalate_to_hrbp'"
+        condition: "calling_agent_response.human_message != 'approved'"
 
   hrbp_human:
     name: "hrbp_human"
     agent_type: "human"
-    is_human_powered: true
-    description: "HRBP — bias / salary-band / policy authority"
-    human_interface: "default"
+    human_interface: "webhook"
     communication_type: "dual"
     human_timeout_seconds: 21600
-    # operator_ids: ["you@yourcompany.com"]   # optional — unset routes this
-    #   gate to the SHARED inbox. Only set real operator emails: a
-    #   placeholder assigns tasks to a nonexistent operator and they
-    #   never appear in anyone's inbox.
+    description: "HRBP — bias / salary-band / policy authority. The accountable owner for everything that leaves the pod."
     fallback_on_timeout: true
     fallback_response:
-      decision: "halt_for_review"
-      message: "halt_for_review"
-      note: "HRBP unavailable — held"
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
     yields:
-      decision: "string"
-      directive: "string"
+      human_message: "string"
     inputs:
       req_id: "string"
     can_call:
       - agent: "recruiting_audit_logger_agent"
+        condition: "always"
 
+  recruiting_manager_human:
+    name: "recruiting_manager_human"
+    agent_type: "human"
+    human_interface: "webhook"
+    communication_type: "dual"
+    human_timeout_seconds: 14400
+    description: "Recruiting manager — team-level escalation on a stalled / thin funnel."
+    fallback_on_timeout: true
+    fallback_response:
+      human_decision: held
+      human_message: held_for_review
+    webhook_config:
+      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
+      outbound_headers: {Content-Type: "application/json"}
+      outbound_timeout: 30
+    yields:
+      human_message: "string"
+    inputs:
+      req_id: "string"
+    can_call:
+      - agent: "recruiting_audit_logger_agent"
+        condition: "always"
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # WORM audit sink — hash-chained, append-only, the terminus of every path.
+  # Registered in main.py via sdk.intelligence("recruiting_audit_logger_agent").
+  # ─────────────────────────────────────────────────────────────────────────
   recruiting_audit_logger_agent:
     name: "recruiting_audit_logger_agent"
     agent_type: "external"
-    description: "Hash-chained WORM"
     framework: "custom"
     communication_type: "execute"
+    description: "WORM audit — hash-chains every screen, correspondence, approval, booking, and held gate. Terminus."
     connector_config:
       sink_type: "local_file"
       local_file_path: "./logs/recruiting_audit.jsonl"
@@ -711,294 +1000,3 @@ agents:
       session_id: "string"
       payload: "object"
     can_call: []
-
-  # ────────────────────────────────────────────────────────────
-  # interview_coordinator_agent — ONE interview coordinator.
-  # Loop-design JUDGMENT is the LLM role (pure YAML — the design
-  # rules the old module enforced are explicit prompt instructions
-  # now). The BOOKING action lives where bookings live: in YOUR
-  # calendar / ATS scheduling — clean loops route straight to
-  # panel_booker_agent (connector); flagged loops go to the
-  # recruiter unbooked, and the recruiter can release them to the
-  # booker with 'book_panel'.
-  # ────────────────────────────────────────────────────────────
-  interview_coordinator_agent:
-    name: "interview_coordinator_agent"
-    agent_type: "llm"
-    description: "Designs the interview loop (dimension coverage + diversity-aware panel + duration cap); clean loops route to panel_booker_agent"
-    model: "gpt-4o-mini"
-    temperature: 0.2
-    max_tokens: 1500
-    communication_type: "chain"
-
-    prompt: |
-      You are the interview coordinator: you design the interview
-      loop for a req. context["prepared_data"]["context"] carries the
-      req's required dimensions + the actual interviewer roster (with each
-      panelist's level) — pre_compose pulled them. Build the loop from
-      THOSE real panelists. Clean loops (no recruiter review needed) are
-      booked automatically right after your design by the panel
-      booker; flagged loops go to the recruiter unbooked.
-
-      Return JSON with these keys (all required):
-        - req_id: echo the req_id from the input VERBATIM
-        - role_level: the level from the input (use "mid" if absent)
-        - panels: list of objects (kind, title, duration_minutes,
-            interviewer_role, interviewer_level, dimension)
-        - total_minutes: sum of duration_minutes across panels
-        - dimensions_covered: sorted list of distinct panel dimensions
-        - panel_diversity_ok: boolean (see hard rules)
-        - requires_recruiter_review: boolean (see hard rules)
-        - loop_briefing: 2 sentence narrative for the recruiter —
-          panels count, total minutes, dimensions covered, and
-          whether panel diversity passed
-
-      Dimension coverage requirements vary by role; pull from the
-      knowledge base under interviewer_roster. Cover each required
-      dimension with exactly one panelist — no double-coverage on
-      the same skill. Select a diversity-aware panel: spread the
-      interviewer levels (at least two distinct levels).
-
-      HARD RULES (your post-processor RE-ENFORCES these — they are floors,
-      not suggestions, so build a clean loop and it will pass through):
-        - The whole loop MUST fit within 5 hours (300 minutes); the
-          post-processor drops panels from the back until it fits.
-        - A hiring-manager debrief slot is ALWAYS appended last by the
-          post-processor: {"kind": "hm_debrief", "duration_minutes": 30,
-          "interviewer_role": "hiring_manager", "dimension": "decision"}.
-        - panel_diversity_ok is RECOMPUTED true ONLY when the panels span
-          at least two distinct non-empty interviewer_level values — so
-          spread the interviewer levels.
-        - requires_recruiter_review is FORCED true when panel_diversity_ok
-          is false OR total_minutes is under 120 (a sub-2-hour loop is too
-          thin to assess a candidate).
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-      {"req_id": "", "role_level": "", "panels": [], "total_minutes": 0, "dimensions_covered": [], "panel_diversity_ok": false, "requires_recruiter_review": false, "loop_briefing": ""}
-
-    enforce_yields: true
-    enforce_yields_retry: 2
-
-    # knowledge: interviewer_roster — loop design draws on the
-    # customer's named interviewers.
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "interviewer_roster"
-
-    yields:
-      req_id: "string"
-      role_level: "string"
-      panels: "list"
-      total_minutes: "number"
-      dimensions_covered: "list"
-      panel_diversity_ok: "boolean"
-      requires_recruiter_review: "boolean"
-      loop_briefing: "string"
-
-    inputs:
-      upstream_yields: "object"
-      req_id: "string"
-      level: "string"
-      candidate_id: "string"
-
-    can_call:
-      - agent: "recruiter_human"
-        condition: "calling_agent_response.requires_recruiter_review == true"
-
-      # Clean loop → straight to the calendar connector.
-      - agent: "panel_booker_agent"
-        condition: "calling_agent_response.requires_recruiter_review == false"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # panel_booker_agent — connector-only actuator (YAML-first
-  # restructure: the old coordinator module's stub "booking" is
-  # gone — interviews are booked where interviews live: YOUR
-  # calendar / ATS scheduling). Point the webhook at an n8n
-  # workflow that creates the calendar events (Google Calendar /
-  # Outlook) or calls your ATS scheduling API (Greenhouse / Lever /
-  # Ashby), and returns:
-  #   {"interviews_booked": <int>, "panel": [...booked slots...]}
-  # Sits on the far side of the recruiter gate for flagged loops —
-  # the thing that ACTS stays a thin agent behind the human.
-  # ────────────────────────────────────────────────────────────
-  panel_booker_agent:
-    name: "panel_booker_agent"
-    agent_type: "programmatic"
-    description: "Books the approved interview panel into your calendar / ATS scheduling via connector"
-    communication_type: "execute"
-    integration: "n8n"
-    connector_config:
-      # Your calendar / ATS-scheduling workflow URL
-      webhook_url: "${N8N_PANEL_BOOKING_WEBHOOK_URL:}"
-      auth_token: "${N8N_AUTH_TOKEN:}"
-    yields:
-      interviews_booked: "number"
-      panel: "list"
-    inputs:
-      req_id: "string"
-      panels: "list"
-    can_call:
-      # A real booking is a fact worth a WORM entry.
-      - agent: "recruiting_audit_logger_agent"
-        condition: "calling_agent_response.interviews_booked > 0"
-
-      # Nothing booked → the connector failed; route to the recruiter
-      # to book manually (mutually exclusive with the audit edge above).
-      - agent: "recruiter_human"
-        condition: "calling_agent_response.interviews_booked == 0"
-    narration: |
-      If the calendar connector booked nothing (interviews_booked ==
-      0) the booking failed — route to recruiter_human to book the
-      panel manually.
-
-  # ────────────────────────────────────────────────────────────
-  # hiring_assistant_agent — Lyzr's flagship: async screen interview
-  # ────────────────────────────────────────────────────────────
-  hiring_assistant_agent:
-    name: "hiring_assistant_agent"
-    agent_type: "llm"
-    description: "First-round async screen — rubric scoring, transcript review, advance/borderline/decline"
-    model: "claude-sonnet-4-6"
-    temperature: 0.2
-    max_completion_tokens: 2500
-    communication_type: "chain"
-
-    prompt: |
-      Conduct (or score) the first-round screen interview. Score the
-      CONVERSATION, not the resume. The resume already passed
-      resume_screener_agent. context["prepared_data"]["context"] carries the
-      candidate record + their prior resume-screen score (pre_compose pulled
-      them). Now we're measuring how they think + speak.
-
-      NEVER ask about: age, family status, religion, ethnicity, where
-      from, accent. Decline-worthy by itself if you do.
-
-      Return JSON with these keys:
-        - screen_id: "screen-" + candidate_id + "-" + 10 random
-          lowercase hex characters
-        - candidate_id, req_id: echo the input values VERBATIM
-        - rubric_scores: a LIST of {"dimension", "weight", "score"}
-          objects covering EXACTLY these five dimensions (score 0..1):
-            · technical_depth      (weight 0.30)
-            · communication        (weight 0.20)
-            · problem_solving      (weight 0.20)
-            · role_motivation      (weight 0.15)
-            · culture_fit_signals  (weight 0.15)
-        - weighted_score: sum of score × weight across the five
-          dimensions, clamped to [0, 1], rounded to 2 decimals
-        - recommendation: see hard rules
-        - bias_flags: list of forbidden topics that actually appeared
-          in the conversation (age, family status, religion,
-          ethnicity, origin, accent, …); [] when none
-        - transcript_chars: character count of the transcript excerpt
-          you scored (cap the excerpt at 5000 chars)
-        - duration_minutes: integer
-        - requires_hrbp_review, requires_hiring_manager_review: see
-          hard rules
-        - conducted_at_utc: current UTC time, ISO-8601
-
-      HARD RULES (deterministic — no judgment):
-        - recommendation = "advance" when weighted_score >= 0.70,
-          "borderline" when 0.55 <= weighted_score < 0.70, otherwise
-          "decline".
-        - MALFORMED PAYLOAD GUARD: if candidate_id or req_id is
-          missing from the input, set recommendation to
-          "error_skipped", both review flags to false, screen_id to
-          "" and every score to 0 — a candidate must NEVER be
-          auto-declined because the payload was malformed.
-        - requires_hrbp_review = true if and only if bias_flags is
-          non-empty.
-        - requires_hiring_manager_review = true if and only if
-          recommendation is "advance" or "borderline".
-
-      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
-      {"screen_id": "", "candidate_id": "", "req_id": "", "rubric_scores": [], "weighted_score": 0, "recommendation": "", "bias_flags": [], "transcript_chars": 0, "duration_minutes": 0, "requires_hrbp_review": false, "requires_hiring_manager_review": false, "conducted_at_utc": ""}
-
-    enforce_yields: true
-
-    knowledge:
-      serviceName: "mongo_main"
-      enabled: true
-      groupName: "interview_rubrics"
-
-    yields:
-      screen_id: "string"
-      candidate_id: "string"
-      req_id: "string"
-      rubric_scores: "list"
-      weighted_score: "number"
-      recommendation: "string"
-      bias_flags: "list"
-      transcript_chars: "number"
-      duration_minutes: "number"
-      requires_hrbp_review: "boolean"
-      requires_hiring_manager_review: "boolean"
-      conducted_at_utc: "string"
-
-    inputs:
-      upstream_yields: "object"
-      candidate_id: "string"
-      req_id: "string"
-
-    can_call:
-      # Bias signal → HRBP hard gate (overrides recommendation)
-      - agent: "hrbp_human"
-        condition: "calling_agent_response.requires_hrbp_review == true"
-
-      # advance / borderline → hiring manager
-      - agent: "hiring_manager_human"
-        condition: "calling_agent_response.requires_hiring_manager_review == true and calling_agent_response.requires_hrbp_review == false"
-
-      # decline → rejection letter (correspondence drafter, rejection mode)
-      - agent: "correspondence_drafter_agent"
-        condition: "calling_agent_response.recommendation == 'decline' and calling_agent_response.requires_hrbp_review == false"
-
-    auto_store_response: true
-    auto_store_yields: true
-
-  # ────────────────────────────────────────────────────────────
-  # bias_audit_agent — weekly EEOC 4/5ths-rule audit.
-  # KEEPS its Python module (agency/bias_audit_agent.py): the
-  # 4/5ths-rule adverse-impact statistics are compliance-grade
-  # domain math that must stay deterministic code. The screening
-  # decisions it audits arrive in the INPUT — export them from
-  # your ATS and POST to the weekly_bias_audit entry point (the
-  # old template-SQLite findings ledger is gone; findings flow to
-  # hrbp_human + the WORM audit log through the mesh).
-  # ────────────────────────────────────────────────────────────
-  bias_audit_agent:
-    name: "bias_audit_agent"
-    agent_type: "programmatic"
-    description: "Weekly batch audit on screening decisions — EEOC 4/5ths rule on each demographic dim"
-    communication_type: "chain"
-    wake_up: "0 8 * * 0"             # Sunday 08:00
-
-    yields:
-      action: "string"
-      window_start_utc: "string"
-      window_end_utc: "string"
-      decisions_audited: "number"
-      findings: "list"
-      adverse_impact_count: "number"
-      requires_hrbp_review: "boolean"
-      generated_at_utc: "string"
-
-    inputs:
-      decisions: "list"
-      window_days: "number"
-
-    narration: |
-      EEOC 4/5ths rule: a group's selection rate must be ≥80% of the
-      highest group's rate. Below that → adverse impact finding.
-      Minimum sample 5 per group to compare.
-
-    can_call:
-      - agent: "hrbp_human"
-        condition: "calling_agent_response.requires_hrbp_review == true"
-
-    auto_store_response: true
-    auto_store_yields: true
