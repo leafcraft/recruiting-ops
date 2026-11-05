@@ -66,7 +66,7 @@ def load_candidate_context(data: Any, ctx: Any) -> dict[str, Any]:
     rid = str(_pick(data, "req_id") or "")
     cid = str(_pick(data, "candidate_id") or "")
     low, high = store.salary_band(rid) if rid else (0, 0)
-    cand = store.get_candidate(cid) if cid else {}
+    cand = store.get_candidate_for_review(cid) if cid else {}
     return {"context": {
         "req_id": rid,
         "candidate_id": cid,
@@ -121,7 +121,7 @@ async def enforce_correspondence_floors(result: dict[str, Any],
                 f"[corr] OFFER band gate → HRBP "
                 f"(amount={amount} band={low}-{high} confirmed={band_confirmed})")
         # Persist the offer so the finisher (Ora) can recover it AFTER the
-        # hiring-manager approval gate drops the upstream payload. PROD: HRIS.
+        # hiring-manager approval step drops the upstream payload. PROD: HRIS.
         rid = str(result.get("req_id") or c.get("req_id") or "")
         if rid:
             store.put_offer(rid, {

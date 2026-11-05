@@ -6,10 +6,11 @@
 # booking -> offer approval -> OFFER ISSUED (finisher) -> live funnel status.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off
-# is a finished contract; every human gate default-denies on silence; the
-# finisher (Ora) produces the real offer artifact and fails closed; the WORM
-# sink is the terminus. Systems (the ATS — Greenhouse / Lever / Ashby, the
-# calendar, LinkedIn Recruiter) are TOOLS inside agents, never members.
+# is a finished contract; nothing advances on silence (an unanswered card
+# closes and the ticket records that no reply came); the finisher (Ora)
+# produces the real offer artifact and fails closed; the WORM sink is the
+# terminus. Systems (the ATS — Greenhouse / Lever / Ashby, the calendar,
+# LinkedIn Recruiter) are TOOLS inside agents, never members.
 #
 # Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
 # Field reference:  .claude/skills/leafmesh/agent-config-fields.md
@@ -21,26 +22,18 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 2592000
-
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates
-# stalls / contract violations / repeated errors to the HRBP (the accountable
-# owner). It is not a router in the middle of the team.
+# The Manager is the SUPERVISOR. It escalates to the HRBP (the accountable
+# owner) only on errors: a non-retryable error (auth / bad request / bad
+# config) the first time it happens, 5 failed agents in one session, or
+# restarts used up. Contract violations (yields not met) alert people; they do
+# not escalate. A question nobody answers is not escalated: the card closes and
+# the ticket records it. Bias signals and out-of-band offers reach the HRBP by
+# can_call routes, not through the Manager. It is not a router in the middle.
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -50,10 +43,9 @@ manager:
     a pipeline -> Sena screens it (confidence + bias floor) -> correspondence
     (outreach / offer / rejection) -> interview loop -> panel booking -> the
     hiring manager approves the offer -> Ora ISSUES it -> live funnel status.
-    Escalate to the HRBP when: a screen raises a bias signal, an offer is outside
-    the salary band, a pipeline stays thin past its re-source bound, an approval
-    round times out, or any agent hands off a malformed artifact. Silence never
-    advances a candidate.
+    Bias signals and out-of-band offers already route to the HRBP through the
+    agents' own routes. You step in on errors: an agent that keeps failing
+    goes to the HRBP. Silence never advances a candidate.
   routing:
     mode: "static"
   escalation:
@@ -63,16 +55,13 @@ manager:
     auto_escalate:
       max_retries: 3
       max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 150
 
 # 2.4.131 runtime block — the ONE non-default this pod genuinely needs: Sena's
 # super-agent screening over a full pipeline can run long. Everything else stays
 # default (omission is meaningful; we do not pre-fill defaults). The `timeouts`
 # block is REJECTED by <=2.4.130 — it must land WITH the 2.4.131 floor.
 timeouts:
+  mesh_call_default_timeout_s: 150
   llm_hard_timeout_s: 300
 
 data_structures:
@@ -263,7 +252,7 @@ agents:
       duplicate_req_id: "string"
       prior_req_id: "string"
       req_complete: "boolean"
-      missing_fields: "list"
+      missing_fields: { type: array, items: string }
     inputs:
       payload: "object"
       upstream_yields: "object"
@@ -280,24 +269,30 @@ agents:
       rather than sourcing blind.
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Sourcing — connector-only actuator: candidates live in YOUR ATS / LinkedIn
-  # Recruiter, not in template code. Point the webhook at an n8n workflow that
-  # queries candidate search and returns {"candidates_found": <int>,
-  # "candidate_ids": [...]}. Inert (${VAR:} empty-defaults) until wired.
+  # Sourcing — the sourcer (programmatic, agency/sourcing_agent.py). Day 0 it
+  # reads the req's open pipeline from the dev store and loads the screening
+  # backlog, so the main flow runs with no system wired. To source from YOUR
+  # ATS / LinkedIn Recruiter: build an n8n workflow that returns
+  # {"candidates_found": <int>, "candidate_ids": [...]}, create the vault
+  # connection 'sourcing_n8n' on Infrastructure → Integrations → n8n (base URL =
+  # the workflow's webhook URL, token = its auth token), then uncomment the two
+  # lines below — here before the first start, in Studio's YAML editor after it.
+  # The same Python then shapes the workflow's reply; a failed call goes to the
+  # recruiter with 0 candidates (it never falls back to seed data).
   # ─────────────────────────────────────────────────────────────────────────
   sourcing_agent:
     name: "sourcing_agent"
     agent_type: "programmatic"
-    description: "Pulls candidates from your ATS / LinkedIn Recruiter via connector"
+    description: "Sourcer — pulls the req's candidate pipeline (dev store day 0; your ATS via n8n when wired) and loads the screening backlog"
     communication_type: "chain"
-    integration: "n8n"
-    connector_config:
-      webhook_url: "${N8N_SOURCING_WEBHOOK_URL:}"
-      auth_token: "${N8N_AUTH_TOKEN:}"
+    # integration: "n8n"
+    # connector_config: {connection: sourcing_n8n}
     yields:
       candidates_found: "number"
       candidate_ids: "list"
       req_id: "string"        # identity passthrough for the screener
+      source: "string"        # dev_store | sourcing_n8n | sourcing_n8n_failed
+      sourcing_note: "string"
     inputs:
       req_id: "string"
       title: "string"
@@ -319,12 +314,12 @@ agents:
   # FORCED to the HRBP; a thin pipeline is re-sourced, never waved through.
   #
   #   super_agent = autonomous plan/execute/verify across many candidates.
-  #   instances   = fan the backlog across parallel copies; each copy CLAIMS a
+  #   scaling.copies = fan the backlog across parallel copies; each copy CLAIMS a
   #                 disjoint batch (claim_candidate_batch) so copies never
-  #                 duplicate work. instances_handoff: last COMBINES the copies —
+  #                 duplicate work. copies.handoff: last COMBINES the copies —
   #                 the shortlists CONCATENATE, and the @chain floor RECOMPUTES
   #                 avg_fit_score from the combined shortlist (so the number-sum
-  #                 merge footgun never bites — see nuances #Parallel instances).
+  #                 merge footgun never bites — see nuances, parallel copies).
   #   @chain      = the bias + score floor (agency/resume_screener_agent.py).
   # Tools are the day-0 dev store; the ATS mcp block below is the live path.
   # ─────────────────────────────────────────────────────────────────────────
@@ -340,8 +335,11 @@ agents:
     super_agent:                     # DICT form = the tuning path (2.4.123+); the ONLY way to tune it
       cost_ceiling: 120000
       wall_clock: 900
-    instances: 3                     # fan the backlog across 3 parallel copies
-    instances_handoff: last          # COMBINE the copies -> one shortlist; @chain recomputes the ratio
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                     # fan the backlog across 3 parallel copies
+        handoff: last          # COMBINE the copies -> one shortlist; @chain recomputes the ratio
     prompt: |
       You are Sena, the Screening Analyst. Turn a candidate pipeline into a
       shortlist scored ONLY on skills + experience — and REFUSE to lean on a
@@ -375,7 +373,14 @@ agents:
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"shortlist": [], "bias_signal": false, "avg_fit_score": 0, "recruiter_briefing": "", "re_source_required": false}
     yields:
-      shortlist: "list"
+      shortlist:
+        type: array
+        items:
+          type: object
+          fields:
+            candidate_id: string
+            fit_score: number
+            top_reason: string
       bias_signal: "boolean"
       avg_fit_score: "number"
       recruiter_briefing: "string"
@@ -402,7 +407,8 @@ agents:
         variables: [req_id]
     # Skills — reusable instruction blocks loaded on demand via
     # load_skill_reference. `bias` is the always-relevant screening skill.
-    # Register the source (see README): filesystem source -> ./skills.
+    # No skill files ship with the pod: add the `recruiting_playbooks` source
+    # and its `bias` / `tone` skills in Studio (see README, Tier 1).
     skills:
       sourceName: "recruiting_playbooks"
       enabled: true
@@ -412,14 +418,14 @@ agents:
     # no real source. See agency/tools.py.
     tools: [claim_candidate_batch, get_req_spec, get_candidate]
     tool_categories: [screening]
-    # ── To wire a real ATS, uncomment and set the URL (each named action under
-    #    `use:` becomes its own tool, e.g. greenhouse_search_candidates). NOTE:
-    #    the SDK rejects an http mcp block with an EMPTY url at load, so this
-    #    ships COMMENTED — fill the URL, then uncomment. ──
+    # ── To wire a real ATS: create the vault connection 'ats_mcp' on
+    #    Infrastructure → Integrations → MCP (the MCP server's URL + token live
+    #    there, never here), then uncomment — here before the first start, in
+    #    Studio's YAML editor after it (applies live, no restart). Each named action under `use:`
+    #    becomes its own tool, e.g. greenhouse_search_candidates. ──
     # mcp:
-    #   - transport: http
-    #     url: "${ATS_MCP_URL}"
-    #     token: "${ATS_MCP_TOKEN:}"
+    #   - connection: ats_mcp   # vault connection holds the URL + token
+    #     transport: http
     #     use: [search_candidates, get_candidate, get_job]
     #     name: greenhouse
     #     timeout: 30
@@ -519,7 +525,7 @@ agents:
     yields:
       correspondence_type: "string"
       message_body: "string"
-      cited_signals: "list"
+      cited_signals: { type: array, items: string }
       offer_body: "string"
       offer_amount_cents: "number"
       within_band: "boolean"
@@ -528,7 +534,7 @@ agents:
       rejection_stage: "string"
       reason_class: "string"
       personalisation_signal: "string"
-      alternate_roles_suggested: "list"
+      alternate_roles_suggested: { type: array, items: string }
       requires_recruiter_review: "boolean"
       req_id: "string"
     inputs:
@@ -606,10 +612,17 @@ agents:
       screen_id: "string"
       candidate_id: "string"
       req_id: "string"
-      rubric_scores: "list"
+      rubric_scores:
+        type: array
+        items:
+          type: object
+          fields:
+            dimension: string
+            weight: number
+            score: number
       weighted_score: "number"
       recommendation: "string"
-      bias_flags: "list"
+      bias_flags: { type: array, items: string }
       transcript_chars: "number"
       duration_minutes: "number"
       requires_hrbp_review: "boolean"
@@ -697,9 +710,19 @@ agents:
     yields:
       req_id: "string"
       role_level: "string"
-      panels: "list"
+      panels:
+        type: array
+        items:
+          type: object
+          fields:
+            kind: string
+            title: string
+            duration_minutes: number
+            interviewer_role: string
+            interviewer_level: string
+            dimension: string
       total_minutes: "number"
-      dimensions_covered: "list"
+      dimensions_covered: { type: array, items: string }
       panel_diversity_ok: "boolean"
       requires_recruiter_review: "boolean"
       loop_briefing: "string"
@@ -719,22 +742,29 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Panel Booker — connector-only actuator: interviews are booked where
-  # interviews live (YOUR calendar / ATS scheduling). Point the webhook at an
+  # interviews live (YOUR calendar / ATS scheduling). Point it at an
   # n8n workflow that creates the events and returns {"interviews_booked":
   # <int>, "panel": [...]}. Sits behind the recruiter gate for flagged loops.
   # ─────────────────────────────────────────────────────────────────────────
   panel_booker_agent:
     name: "panel_booker_agent"
     agent_type: "programmatic"
-    description: "Books the approved interview panel into your calendar / ATS scheduling via connector"
-    communication_type: "execute"
-    integration: "n8n"
-    connector_config:
-      webhook_url: "${N8N_PANEL_BOOKING_WEBHOOK_URL:}"
-      auth_token: "${N8N_AUTH_TOKEN:}"
+    description: "Books the approved interview panel into your calendar / ATS scheduling (day 0: records the proposed panel; the recruiter books it)"
+    communication_type: "chain"
+    # Day 0 there is no calendar, so agency/panel_booker_agent.py books nothing:
+    # it records the proposed panel and returns interviews_booked 0, which sends
+    # it to the recruiter to book by hand. To book for real: build an n8n
+    # workflow that creates the events and returns {"interviews_booked": <int>,
+    # "panel": [...]}, create the vault connection 'panel_booking_n8n' on
+    # Infrastructure → Integrations → n8n (base URL = the workflow's webhook
+    # URL, token = its auth token), then uncomment the two lines below — here
+    # before the first start, in Studio's YAML editor after it.
+    # integration: "n8n"
+    # connector_config: {connection: panel_booking_n8n}
     yields:
       interviews_booked: "number"
       panel: "list"
+      booking_note: "string"
     inputs:
       req_id: "string"
       panels: "list"
@@ -751,7 +781,7 @@ agents:
 
   # ─────────────────────────────────────────────────────────────────────────
   # Ora — Offer Issuer (programmatic FINISHER). Sits BEHIND the hiring-manager
-  # approval gate. It never approves — it re-checks that a human actually
+  # approval step. It never approves — it re-checks that a human actually
   # approved (allow-token allowlist + block-token denylist; an UNKNOWN verdict
   # fails closed), re-derives within_band from the band of record (a human can't
   # waive it), renders the real offer letter to ./out, DELETES the partial on a
@@ -759,12 +789,20 @@ agents:
   # across the HITL boundary from the session stash / dev store. Never issues an
   # offer nobody approved and never fakes a real ack.
   # See agency/offer_issuer_agent.py for the enforce-issuance floor.
+  # Day 0 the issued offer is recorded in the dev outbox (./data/outbox.json);
+  # nothing is sent to an HRIS. To post Ora's finished output to your HRIS:
+  # create an Outbound webhook record on Infrastructure ("Add custom", service
+  # type 'Outbound webhook'), add a webhook named 'hris_offer_issued' on Tools →
+  # Webhooks that picks it, then uncomment the `notify` line. It posts every
+  # finished run — blocked ones too — so the receiving side must act only on
+  # status == "issued". Nothing reads the reply.
   # ─────────────────────────────────────────────────────────────────────────
   offer_issuer_agent:
     name: "offer_issuer_agent"
     agent_type: "programmatic"
     communication_type: "chain"
     description: "Offer Issuer — re-checks approval, re-derives band, renders the offer letter, WORM ledger; fails closed"
+    # notify: {webhook: hris_offer_issued, when: done}
     yields:
       approved: "boolean"
       issued: "boolean"
@@ -790,16 +828,22 @@ agents:
     name: "recruiting_ops_agent"
     agent_type: "programmatic"
     description: "Recruiting-ops analyst — thin-funnel sweep + stage / time-to-hire metrics read from your ATS"
-    communication_type: "execute"
+    communication_type: "chain"
     integration: "n8n"
-    # ── Scheduled sweep — enable AFTER wiring the ATS connector. When you do,
+    # ── Scheduled sweep — enable AFTER wiring the ATS connector (here before the
+    #    first start, in Studio's YAML editor after it). When you do,
     #    keep the `timezone` line so it fires in your business timezone, NOT UTC
     #    (a bare cron runs in UTC — nuances #13). ──
     # wake_up: "0 9 * * 1-5"
     # timezone: "America/New_York"
-    connector_config:
-      webhook_url: "${N8N_ATS_FUNNEL_WEBHOOK_URL:}"
-      auth_token: "${N8N_AUTH_TOKEN:}"
+    # Day 0 the record does not exist yet. Its address + token
+    # live only in the vault: create the vault connection 'ats_funnel_n8n' on
+    # Infrastructure → Integrations → n8n (or an "Add custom" record, service type
+    # Tools — base URL = the workflow's webhook URL, token = its auth token),
+    # until it exists the SDK switches this agent off with a notice (it is
+    # never called without an address); it switches on, with no restart,
+    # once the record exists.
+    connector_config: {connection: ats_funnel_n8n}
     yields:
       thin_reqs: "list"
       escalate: "boolean"
@@ -869,16 +913,23 @@ agents:
     auto_store_yields: true
 
   # ─────────────────────────────────────────────────────────────────────────
-  # Human members — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held_for_review -> audit).
+  # Human members — first-class, answering in Studio's Inbox.
+  # Nothing is approved, sent or booked on silence. If nobody answers within a
+  # seat's human_timeout_seconds, the request waits no longer: its Inbox card
+  # closes and the ticket records that no reply came. Nobody is chased
+  # automatically. fallback_on_timeout / fallback_response (held_for_review ->
+  # audit) are kept as the declared intent; on leafmesh 2.4.486 a dual seat's
+  # timeout routes nothing.
+  # Timeouts are working hours: recruiter 2h, recruiting manager 4h, hiring
+  # manager and HRBP one business day (8h).
   # `dual` belongs on the human/webhook boundary agent ONLY — every downstream
-  # target here is a NON-human (chain / execute), so no dual<->dual ping-pong.
+  # target here is a NON-human (chain), so no dual<->dual ping-pong.
   # ─────────────────────────────────────────────────────────────────────────
 
   recruiter_human:
     name: "recruiter_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 7200
     description: "Recruiter — reviews outreach + shortlists, releases flagged loops to booking."
@@ -886,12 +937,12 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
-      max_retries: 1
-      retry_delay: 2
+    human_prompt_template: |
+      A recruiting item needs you (outreach to send, a thin pipeline, a flagged
+      rejection or interview loop, or a panel to book by hand).
+      Reply "book_panel" to send an interview loop to the panel booker.
+      Any other reply (for example "sent", "booked", "re-source", "hold") is
+      recorded in the audit log and ends this item.
     yields:
       human_message: "string"
     inputs:
@@ -900,53 +951,54 @@ agents:
       # Recruiter released a flagged interview loop -> book it now.
       - agent: "panel_booker_agent"
         condition: "calling_agent_response.human_message == 'book_panel'"
-      # Silence / hold / any non-book reply is recorded; the Manager SUPERVISOR
-      # escalates from here (manager.escalation -> HRBP) — no human->human wire.
+      # Any other reply (and the held_for_review fallback) is recorded.
       - agent: "recruiting_audit_logger_agent"
         condition: "calling_agent_response.human_message != 'book_panel'"
 
   hiring_manager_human:
     name: "hiring_manager_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 14400
+    human_timeout_seconds: 28800    # one business day
     description: "Hiring manager — final offer approval; an approved offer is issued by Ora."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
+    human_prompt_template: |
+      An in-band offer is ready for your approval.
+      Reply "approved" to have it issued, "rejected" to stop it, or "hold".
+      Only "approved" issues the offer; every other reply is recorded in the
+      audit log.
     yields:
-      human_message: "string"       # approved | rejected | held_for_review
+      human_message: "string"       # approved | rejected | hold | held_for_review
     inputs:
       req_id: "string"
     can_call:
       # Approved -> the finisher issues the offer (which re-checks approval).
       - agent: "offer_issuer_agent"
         condition: "calling_agent_response.human_message == 'approved'"
-      # Anything else (hold / reject / silence) is recorded; Manager escalates.
+      # Anything else (rejected / hold / the held_for_review fallback) is recorded.
       - agent: "recruiting_audit_logger_agent"
         condition: "calling_agent_response.human_message != 'approved'"
 
   hrbp_human:
     name: "hrbp_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
-    human_timeout_seconds: 21600
+    human_timeout_seconds: 28800    # one business day
     description: "HRBP — bias / salary-band / policy authority. The accountable owner for everything that leaves the pod."
     fallback_on_timeout: true
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
+    human_prompt_template: |
+      A bias signal, an out-of-band or unconfirmed-band offer, or an
+      adverse-impact finding needs your review. Your decision is recorded in
+      the audit log. The pod never issues an offer outside the confirmed band:
+      to go ahead, confirm or change the band in the ATS and redraft the offer.
     yields:
       human_message: "string"
     inputs:
@@ -958,7 +1010,7 @@ agents:
   recruiting_manager_human:
     name: "recruiting_manager_human"
     agent_type: "human"
-    human_interface: "webhook"
+    human_interface: "default"   # the Inbox (no vault connection needed)
     communication_type: "dual"
     human_timeout_seconds: 14400
     description: "Recruiting manager — team-level escalation on a stalled / thin funnel."
@@ -966,10 +1018,6 @@ agents:
     fallback_response:
       human_decision: held
       human_message: held_for_review
-    webhook_config:
-      outbound_url: "${HITL_OUTBOUND_URL:http://127.0.0.1:9999/human-notify}"
-      outbound_headers: {Content-Type: "application/json"}
-      outbound_timeout: 30
     yields:
       human_message: "string"
     inputs:
@@ -986,7 +1034,7 @@ agents:
     name: "recruiting_audit_logger_agent"
     agent_type: "external"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     description: "WORM audit — hash-chains every screen, correspondence, approval, booking, and held gate. Terminus."
     connector_config:
       sink_type: "local_file"

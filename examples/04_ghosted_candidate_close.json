@@ -1,10 +1,10 @@
 {
   "_entry_point": "ghosted_candidate_close",
-  "_description": "Candidate went silent 14 days after onsite \u2014 drafts a polite close-out letter.",
+  "_description": "Candidate went silent 14 days after the onsite \u2014 drafts a polite close-out letter.",
   "payload": {
-    "candidate_id": "cand-ai-2026-1188",
+    "candidate_id": "cand-204",
     "candidate_name": "Asa Idahosa",
-    "req_id": "REQ-2026-0091",
+    "req_id": "req-frontend-002",
     "stage_reached": "onsite",
     "last_contact_utc": "2026-05-21T15:00:00Z",
     "days_silent": 14,
