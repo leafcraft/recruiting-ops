@@ -1,23 +1,23 @@
 {
   "_entry_point": "req_filed",
-  "_description": "Hiring manager files a senior engineer req. req_intake normalises; sourcing_agent then pulls the candidate pipeline from your ATS connector; screener filters.",
+  "_description": "The payments hiring manager's req is filed. Cass opens the case, intake normalises it against the band of record, sourcing loads the screen-stage pipeline (dev store day 0), Sena's copies screen it, and clean outreach goes to the recruiter.",
   "payload": {
-    "req_id": "REQ-2026-0099",
+    "req_id": "req-payments-001",
     "title": "Senior Backend Engineer \u2014 Payments",
     "level": "senior",
-    "location": "remote_us",
-    "hiring_manager": "eng.manager@example",
+    "location": "Remote (US)",
+    "hiring_manager": "Renee Castillo",
     "team": "Payments Platform",
-    "salary_band_low_cents": 18000000,
-    "salary_band_high_cents": 24000000,
+    "salary_band_low_cents": 17000000,
+    "salary_band_high_cents": 21000000,
     "must_haves": [
-      "7+ years Python",
+      "5+ years backend (Go or Java)",
       "Production payments experience",
-      "Distributed systems"
+      "Event streaming (Kafka)"
     ],
     "nice_to_haves": [
-      "FinTech background",
-      "Open-source contributions"
+      "Ledger / reconciliation design",
+      "PCI DSS scope work"
     ]
   }
 }

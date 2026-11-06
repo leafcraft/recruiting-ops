@@ -5,16 +5,18 @@ CLAIMS and READS the candidate pipeline through her tools (claim_candidate_batch
 -> get_req_spec -> get_candidate) and produces a skills-and-experience shortlist.
 The MODEL decides and pulls; this CODE fails closed.
 
-She runs as `instances: 3` (config): three parallel copies each claim a DISJOINT
+She runs with `scaling.copies.count: 3` (config): three parallel copies each claim a DISJOINT
 batch via the atomic claim tool, so the backlog is split, not duplicated. With
-`instances_handoff: last` the copies' shortlists CONCATENATE into one — and this
-is exactly why the number-sum merge footgun (nuances #Parallel instances) never
+`scaling.copies.handoff: last` the copies' shortlists CONCATENATE into one — and this
+is exactly why the number-sum merge footgun (nuances, parallel copies) never
 bites here: enforce_screen_floors RECOMPUTES avg_fit_score from the combined
 shortlist rather than trusting a summed self-report.
 
 @chain enforce_screen_floors — the deterministic floors a prompt can't waive:
   (a) BIAS: if any top_reason / briefing leans on a bias-prone signal (name /
       school prestige / photo / address), force bias_signal=true -> HRBP.
+  (0) NO DATA: a shortlisted candidate whose record has no skills and no
+      resume summary is DROPPED — a score on nothing is a guess.
   (b) SCORE: recompute avg fit from the shortlist; a thin shortlist
       (< MIN_SHORTLIST) or a weak avg (< MIN_AVG_FIT) forces re_source_required,
       and the re-source loop is bounded (Rule 3) so it escalates, never spins.
@@ -26,7 +28,7 @@ import re
 from typing import Any
 
 from leafmesh import LeafMeshLogger, chain
-from agency._shared import session_stash
+from agency._shared import session_stash, store
 
 logger = LeafMeshLogger(__name__)
 
@@ -78,9 +80,27 @@ def _bias_in_text(blob: str) -> bool:
     return any(re.search(rf"\b{re.escape(t)}", blob) for t in _BIAS_TERMS)
 
 
+def _has_no_data(candidate_id: str) -> bool:
+    """True when the record of truth holds no skills and no resume summary.
+    An unknown id (not in the dev store, e.g. read through the ATS mcp tools)
+    is not judged here."""
+    rec = store.get_candidate(str(candidate_id or ""))
+    if not rec:
+        return False
+    return not rec.get("skills") and not str(rec.get("resume_summary") or "").strip()
+
+
 async def enforce_screen_floors(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
     result = result if isinstance(result, dict) else {}
     shortlist = result.get("shortlist") or []
+
+    # (0) NO-DATA FLOOR — never keep a score on a record with nothing to score.
+    kept = [s for s in shortlist
+            if not (isinstance(s, dict) and _has_no_data(s.get("candidate_id", "")))]
+    if len(kept) != len(shortlist):
+        logger.info(f"[screener] FLOOR dropped {len(shortlist) - len(kept)} no-data candidate(s)")
+    shortlist = kept
+    result["shortlist"] = shortlist
 
     # (a) BIAS FLOOR — the model's reasoning text betrays bias-prone leaning.
     reasons = " ".join(
