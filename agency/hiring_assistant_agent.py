@@ -62,7 +62,7 @@ def _pick(data: Any, key: str) -> Any:
 
 def load_candidate(data: Any, ctx: Any) -> dict[str, Any]:
     cid = str(_pick(data, "candidate_id") or "")
-    cand = store.get_candidate(cid) if cid else {}
+    cand = store.get_candidate_for_review(cid) if cid else {}
     return {"context": {
         "candidate_id": cid,
         "candidate": cand,

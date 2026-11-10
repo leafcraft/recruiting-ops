@@ -1,7 +1,7 @@
 """Ora — Offer Issuer (the FINISHER / actuator).
 
 auto_discover matches `offer_issuer_agent`. Ora sits BEHIND the hiring-manager
-approval gate. She never approves — she re-checks that a human actually approved,
+approval step. She never approves — she re-checks that a human actually approved,
 re-derives the salary band from the record, renders the real offer letter, and
 records an append-only ledger entry. She is the concrete "@chain fails closed":
 
@@ -16,6 +16,10 @@ records an append-only ledger entry. She is the concrete "@chain fails closed":
   d) dev-store recovery — after the HITL gate the upstream payload is dropped,
      so Ora recovers the offer from the session stash / dev store, and the
      dev-store delivery ANNOUNCES itself (it is not a real send ack).
+
+Idempotent per offer: the same terms (req + candidate + amount) already
+issued are not issued twice — a re-approval or a replayed hand-off is blocked,
+not re-rendered and re-ledgered. A revised offer (a new amount) issues.
 """
 from __future__ import annotations
 
@@ -136,10 +140,6 @@ def _delete_partial(result: dict) -> None:
         result["offer_letter_path"] = ""
 
 
-def _connector_wired() -> bool:
-    return bool(os.getenv("HRIS_OFFER_WEBHOOK_URL") or os.getenv("ATS_MCP_URL"))
-
-
 def enforce_issuance_floor(result: Any, context: dict) -> dict:
     """The finisher floor — issue ONLY on a real approval + a within-band offer."""
     result = result if isinstance(result, dict) else {}
@@ -172,10 +172,21 @@ def enforce_issuance_floor(result: Any, context: dict) -> dict:
         logger.info("[ora] issuance floor BLOCKED: out-of-band")
         return result
 
-    # Passed the floor — render, ledger, record delivery (dev store announces
-    # itself: the letter file is real; the delivery is a DEV record, not an ack).
+    if store.offer_already_issued(str(offer.get("req_id") or ""),
+                                  str(offer.get("candidate_id") or ""),
+                                  int(offer.get("offer_amount_cents") or 0)):
+        result.update(status="blocked", issued=False)
+        result["block_reasons"].append("this offer was already issued (same req, candidate and amount)")
+        _delete_partial(result)
+        logger.info("[ora] issuance floor BLOCKED: duplicate issue")
+        return result
+
+    # Passed the floor — render, ledger, record delivery. The letter file is
+    # real; the delivery is a DEV outbox record, not an HRIS ack. Ora sends
+    # nothing itself: to post the finished offer to your HRIS, set `notify` on
+    # offer_issuer_agent in the configuration (the mesh posts the output).
     result["offer_letter_path"] = _render_offer_letter(offer)
-    delivery = "hris" if _connector_wired() else "dev_store"
+    delivery = "dev_store"
     store.record_outbox({"req_id": offer.get("req_id"),
                          "candidate_id": offer.get("candidate_id"),
                          "action": "issue_offer", "delivery": delivery,

@@ -1,15 +1,15 @@
 {
   "_entry_point": "direct_call_correspondence_drafter",
-  "_description": "Candidate cleared all loops \u2014 correspondence_drafter (offer mode, inferred from the offer terms) produces the offer letter, within_band check confirms compensation policy.",
+  "_description": "Priya Nair cleared the onsite. The drafter writes the offer at $205,000 base \u2014 inside the $170,000\u2013$210,000 band of record \u2014 so it goes to the hiring manager. Change proposed_base_cents to 23500000 (her ask) to see the band gate send it to the HRBP instead.",
   "payload": {
-    "req_id": "REQ-2026-0099",
-    "candidate_id": "cand-tw-2026-1503",
-    "candidate_name": "Talia Wong",
+    "req_id": "req-payments-001",
+    "candidate_id": "cand-103",
+    "candidate_name": "Priya Nair",
     "stage_reached": "offer",
-    "proposed_base_cents": 22000000,
+    "proposed_base_cents": 20500000,
     "proposed_equity_units": 3500,
     "proposed_signing_bonus_cents": 1500000,
-    "start_date": "2026-07-21",
+    "start_date": "2026-08-03",
     "level": "senior"
   }
 }
