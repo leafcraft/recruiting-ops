@@ -12,7 +12,7 @@
 > interviewer** runs the first async round; an **EEOC compliance auditor**
 > runs the weekly 4/5ths-rule adverse-impact check. A **talent
 > coordinator** (Cass) opens each case; **Ora**, the offer issuer, is the
-> finisher. Four people hold the gates — **recruiter, hiring manager,
+> finisher. Four people own the decisions — **recruiter, hiring manager,
 > recruiting manager, HRBP** — and nothing advances on their silence. A
 > hash-chained WORM audit closes every terminal branch.
 >
@@ -82,13 +82,14 @@
 
    human seats (nothing advances on silence):
    recruiter_human ─ book_panel ─► panel_booker_agent; else ─► WORM
-   hiring_manager_human ─ approved ─► offer_issuer_agent (Ora) ─► WORM; else ─► WORM
+   hiring_manager_human ─ approve ─► offer_issuer_agent (Ora) ─► WORM; else ─► WORM
    recruiting_manager_human, hrbp_human ─► WORM
 ```
 
 The chain flows **forward** — each entry point kicks work off and the
 originator steps out; nothing returns to a conductor hub. There are no
-human→human routes: each seat decides and its answer is recorded. The one
+human→human routes: each seat decides and its verdict is recorded (an
+`answer` to an agent's question goes back to only that agent). The one
 cycle is recruiter → booker → recruiter when no calendar is wired, and each
 turn of it waits for the recruiter.
 
@@ -227,7 +228,7 @@ non-diverse or sub-2-hour loop. **Wires.** → `recruiter_human` when
 ### 4.5 `panel_booker_agent` — interview scheduling coordinator (PROGRAMMATIC · n8n)
 Connector-only actuator: creates the calendar events / calls the ATS
 scheduling API, returns `{interviews_booked, panel}`. Sits behind the
-recruiter gate for flagged loops (the recruiter releases them with
+recruiter step for flagged loops (the recruiter releases them with
 `book_panel`). **Wires.** → `recruiting_audit_logger_agent` when
 `interviews_booked > 0` (a booking is a fact worth a WORM entry); →
 `recruiter_human` when `interviews_booked == 0` (booking failed — book
@@ -265,20 +266,21 @@ minimum-sample floor of 5. **Wires.** → `hrbp_human` when
 `requires_hrbp_review == true` (an adverse-impact finding).
 
 ### 4.9 The human seats (nothing advances on silence)
-- `recruiter_human` (2h) → `panel_booker_agent` on `book_panel`; any other
-  reply → WORM.
+- `recruiter_human` (2h) → `panel_booker_agent` on `book_panel`; `hold` →
+  WORM.
 - `hiring_manager_human` (one business day, 8h) → `offer_issuer_agent` on
-  `approved`; `rejected` / `hold` / anything else → WORM.
+  `approve`; `hold` (no, not now, anything unclear) → WORM.
 - `recruiting_manager_human` (4h) → WORM.
 - `hrbp_human` (one business day, 8h) → WORM. The HRBP cannot push an
   out-of-band offer out: Ora re-derives the band and blocks it.
 
-If nobody answers in time, the request waits no longer: the Inbox card
-closes and the ticket records that no reply came. Nothing is sent, approved
-or booked, and nobody is chased automatically. Every seat keeps
-`fallback_on_timeout: true` + `fallback_response: held_for_review` (which
-routes to WORM) as the declared intent; on leafmesh 2.4.486 a timeout on a
-`dual` seat routes nothing. `operator_ids` are left unset so gates route to
+Every seat is `chain` with a `reply_reader` (`gpt-4o-mini`): the person
+types a reply and the reader turns it into a `verdict`; the routes above read
+`verdict`. On any seat, `answer` goes back to only the agent that asked.
+If nobody answers in time, `fallback_on_timeout: true` + `fallback_response`
+(`verdict: hold`, `held_for_review`) goes through the seat's routes like any
+reply and lands in WORM. Nothing is sent, approved or booked, and nobody is
+chased automatically. `operator_ids` are left unset so gates route to
 the **shared inbox** (a placeholder email would make the task invisible).
 
 ### 4.9a `offer_issuer_agent` — Ora, the offer issuer (PROGRAMMATIC · finisher)
@@ -339,9 +341,9 @@ Terminal (`can_call: []`).
   zero-found, ops recruiter-action, booking zero-booked), each mutually
   exclusive with its sibling so exactly one fires.
 - **Nothing on silence.** No seat's timeout approves, sends or books
-  anything; the card closes and the ticket records it. Every seat's
-  `can_call` covers every reply word its prompt offers plus the
-  `held_for_review` fallback (checked by the template's tests).
+  anything; the default `hold` goes to WORM. Every seat's `can_call`
+  covers every verdict its reply reader offers, including the `hold`
+  fallback (checked by the template's tests).
 - **Offer issuance is fail-closed and idempotent.** Ora issues only on an
   explicit approval, inside the band of record, and never the same terms
   twice.
@@ -376,7 +378,7 @@ page, service type 'Outbound webhook').
   and the salary-band/personalisation guardrails enforced as HARD RULES.
 - **One interview coordinator + one booker.** Loop design (judgment) is the
   LLM role; booking (a side-effect into the customer's calendar) is a thin
-  connector behind the recruiter gate — the thing that *acts* stays small.
+  connector behind the recruiter step — the thing that *acts* stays small.
 - **Connectors for systems of record.** Sourcing, funnel ledger and panel
   booking go through `n8n` workflows — the data lives in the customer's
   ATS/calendar. The sourcer and booker keep a small Python module so day 0

@@ -46,7 +46,7 @@ def peek(session_id: str, key: str, default: int = 0) -> int:
 
 def resolve_session_id(input_data: Any, context: Any) -> str:
     """Best-effort session id, tolerating the several shapes the SDK delivers
-    it in — used by the finisher to recover the offer across the HITL gate."""
+    it in — used by the finisher to recover the offer across the human step."""
     for src in (input_data, context):
         if not isinstance(src, dict):
             continue

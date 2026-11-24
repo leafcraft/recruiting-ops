@@ -399,7 +399,7 @@ def claim_candidate_batch(req_id: str, count: int = 4) -> dict[str, Any]:
 #    outbox — the finisher (Ora) writes here day-0 with no connector wired. ──
 def put_offer(req_id: str, offer: dict[str, Any]) -> None:
     """Persist a drafted offer so the finisher can recover it across the HITL
-    approval step (the upstream payload is dropped after the human gate).
+    approval step (the upstream payload is dropped after the human step).
     PROD: the HRIS / ATS offer record."""
     key = str(req_id or "").strip()
     if not key:

@@ -94,7 +94,7 @@ Three tiers — start at the top; each lower tier unlocks more of the mesh.
 ### Tier 1 — Boot (required to start the mesh)
 | Var | Why |
 |---|---|
-| `LEAFMESH_LICENSE_KEY` | SDK license |
+| `LEAFMESH_LICENSE_KEY` | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `OPENAI_API_KEY` | the `gpt-4o-mini` agents (intake, screener, coordinator) + the manager |
 | `ANTHROPIC_API_KEY` | the `claude-sonnet-4-6` agents (correspondence writer, screening interviewer) |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | session + state store (defaults `localhost:6379`) |
@@ -174,21 +174,26 @@ you POST to the `weekly_bias_audit` entry point — no connector needed).
 | `hiring_assistant_agent` | First-round screening interviewer | Score the async first round on a 5-dimension rubric; advance/borderline/decline | LLM (`claude-sonnet-4-6`) + module (`@pre_compose` pulls the candidate, `@chain` derives recommendation + bias gate); → HRBP / hiring manager / rejection draft |
 | `recruiting_ops_agent` | Recruiting-operations analyst | Read the ATS funnel — thin-funnel sweep, stage + time-to-hire metrics | `programmatic` · `n8n` (vault connection `ats_funnel_n8n`); → recruiting manager if thin, else → recruiter |
 | `bias_audit_agent` | EEOC compliance auditor | Weekly 4/5ths-rule adverse-impact audit on screening decisions | `programmatic` Python (`agency/bias_audit_agent.py`), cron `0 8 * * 0`; → HRBP on finding |
-| `recruiter_human` | Recruiter | Review outreach/shortlists/flagged loops; book panels; release flagged panels to booking | `human` (2h); `book_panel` → booker, any other reply → WORM |
-| `hiring_manager_human` | Hiring manager | Final approval on a clean, in-band offer | `human` (one business day, 8h); `approved` → Ora, any other reply → WORM |
+| `recruiter_human` | Recruiter | Review outreach/shortlists/flagged loops; book panels; release flagged panels to booking | `human` (2h); verdict `book_panel` → booker, `hold` → WORM |
+| `hiring_manager_human` | Hiring manager | Final approval on a clean, in-band offer | `human` (one business day, 8h); verdict `approve` → Ora, `hold` → WORM |
 | `recruiting_manager_human` | Recruiting manager | Team-level call on a thin or stalled funnel (from the funnel analyst) | `human` (4h); → WORM |
 | `hrbp_human` | HR business partner | Bias / salary-band / policy authority — the highest gate; also gets the Manager's error escalations | `human` (one business day, 8h); → WORM |
 | `recruiting_audit_logger_agent` | Compliance records keeper | Hash-chained, append-only audit of every terminal decision | `external` `custom` WORM (registered in `main.py`); terminal |
 
 ### When nobody answers
 
+The Inbox has no buttons. Each person types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into a `verdict` from the table above. Anything that is
+not a clear yes — no, not now, wait — reads as `hold` and goes to WORM. If the
+person answered an agent's question instead of deciding, the verdict is
+`answer` and it goes back to only the agent that asked.
+
 Nothing is sent, approved or booked on silence. If nobody answers a seat within
 its time (recruiter 2h, recruiting manager 4h, hiring manager and HRBP one
-business day), the request waits no longer: its Inbox card closes and the
-ticket records that no reply came. Nobody is chased automatically — the
-recruiter or hiring manager picks it up from the ticket. Each seat keeps
-`fallback_on_timeout` / `fallback_response: held_for_review` in config as the
-declared intent; on leafmesh 2.4.486 a timeout on these seats routes nothing.
+business day), the seat's default reply (`fallback_response`: `verdict: hold`,
+`held_for_review`) goes through its routes like any reply and is recorded in
+WORM. Nobody is chased automatically — the recruiter or hiring manager picks it
+up from the record.
 
 The Manager escalates to the HRBP only on errors: a non-retryable error (sign-in,
 bad request, bad config) the first time it happens, five failed agents in one

@@ -13,7 +13,7 @@ records an append-only ledger entry. She is the concrete "@chain fails closed":
      unconfirmed band fails closed).
   c) render the real offer letter to ./out; on a tripped floor, DELETE the
      partial and record `status: blocked` with reasons — never a half-issued offer.
-  d) dev-store recovery — after the HITL gate the upstream payload is dropped,
+  d) dev-store recovery — after the human step the upstream payload is dropped,
      so Ora recovers the offer from the session stash / dev store, and the
      dev-store delivery ANNOUNCES itself (it is not a real send ack).
 
@@ -56,7 +56,7 @@ def _signal(input_data: dict) -> str:
     for src in sources:
         if not isinstance(src, dict):
             continue
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()
